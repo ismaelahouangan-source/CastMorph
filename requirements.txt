@@ -1,0 +1,5 @@
+streamlit
+yt-dlp
+edge-tts
+google-genai
+pydub
