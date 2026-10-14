@@ -89,7 +89,7 @@ def transcrire_et_diariser(chemin_audio: str, api_key: str, contexte: str):
 
     with st.spinner("Transcription et identification des intervenants en cours..."):
         reponse = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.8-flash',
             contents=[audio_file, prompt],
             config=types.GenerateContentConfig(
                 temperature=0.2,
@@ -135,7 +135,7 @@ def traduire_dialogue(script_vo, api_key: str):
 
     with st.spinner("Traduction du dialogue en français en cours..."):
         reponse = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.8-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
