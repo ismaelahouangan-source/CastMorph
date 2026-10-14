@@ -3,8 +3,8 @@ import os
 import json
 import asyncio
 import tempfile
+import subprocess
 import yt_dlp
-from pydub import AudioSegment
 import edge_tts
 from google import genai
 from google.genai import types
@@ -175,7 +175,7 @@ def traduire_dialogue(script_vo, api_key: str):
     return json.loads(reponse.text)
 
 # ---------------------------------------------------------
-# ÉTAPE 4 : SYNTHÈSE VOCALE MULTI-VOIX SANS POLLUTION
+# ÉTAPE 4 : SYNTHÈSE VOCALE MULTI-VOIX VIA FFMPEG
 # ---------------------------------------------------------
 async def generer_clip_audio(texte: str, voix: str, chemin_fichier: str):
     comm = edge_tts.Communicate(texte, voix)
@@ -199,32 +199,54 @@ def orchestrer_synthese_vocale(script_vf):
                 map_locuteurs_voix[locuteur] = VOIX_HOMMES[index_h % len(VOIX_HOMMES)]
                 index_h += 1
 
-    # 2. Génération et fusion avec respirations
-    piste_complete = AudioSegment.silent(duration=200)
-    silence_inter_replique = AudioSegment.silent(duration=350)
-
     total = len(script_vf)
     barre = st.progress(0, text="Initialisation de la synthèse vocale...")
 
     with tempfile.TemporaryDirectory() as dossier_tmp:
+        # Fichier de silence (0.35s) généré avec ffmpeg
+        chemin_silence = os.path.join(dossier_tmp, "silence.mp3")
+        cmd_silence = [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "anullsrc=r=24000:cl=mono",
+            "-t", "0.35", "-q:a", "9",
+            chemin_silence
+        ]
+        subprocess.run(cmd_silence, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        fichiers_liste = []
+
+        # Génération segment par segment
         for i, seg in enumerate(script_vf):
             texte_a_lire = seg["texte_fr"].strip()
             if not texte_a_lire:
                 continue
 
             voix = map_locuteurs_voix[seg["nom_locuteur"]]
-            clip_path = os.path.join(dossier_tmp, f"replique_{i}.mp3")
+            clip_path = os.path.join(dossier_tmp, f"replique_{i:04d}.mp3")
 
             asyncio.run(generer_clip_audio(texte_a_lire, voix, clip_path))
 
-            morceau = AudioSegment.from_file(clip_path, format="mp3")
-            piste_complete += morceau + silence_inter_replique
+            # Ajout de la réplique puis d'une pause
+            fichiers_liste.append(clip_path)
+            fichiers_liste.append(chemin_silence)
 
             pct = int(((i + 1) / total) * 100)
             barre.progress(pct, text=f"Voix de {seg['nom_locuteur']} ({i + 1}/{total})...")
 
+        # Fichier concat list pour ffmpeg
+        concat_txt = os.path.join(dossier_tmp, "concat_list.txt")
+        with open(concat_txt, "w", encoding="utf-8") as f:
+            for item in fichiers_liste:
+                f.write(f"file '{item}'\n")
+
+        # Fusion sans ré-encodage via ffmpeg
         fichier_mp3_final = os.path.join(dossier_tmp, "podcast_vf_complet.mp3")
-        piste_complete.export(fichier_mp3_final, format="mp3")
+        cmd_concat = [
+            "ffmpeg", "-y", "-f", "concat",
+            "-safe", "0", "-i", concat_txt,
+            "-c", "copy", fichier_mp3_final
+        ]
+        subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         with open(fichier_mp3_final, "rb") as f:
             audio_bytes = f.read()
