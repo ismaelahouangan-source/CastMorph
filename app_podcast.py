@@ -4,32 +4,33 @@ import json
 import asyncio
 import tempfile
 import subprocess
+import re
 import edge_tts
 from google import genai
 from google.genai import types
 
 # ---------------------------------------------------------
-# CONFIGURATION DE LA PAGE & VOIX HD
+# CONFIGURATION DE LA PAGE & VOIX VALIDÉES EDGE-TTS
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="CastMorph - Doublage de Podcasts HD",
+    page_title="CastMorph - Studio de Doublage HD",
     page_icon="🎙️",
     layout="wide"
 )
 
-# Réservoirs de voix pour différencier les locuteurs
+# Voix neuronales françaises certifiées
 VOIX_HOMMES = [
-    "fr-FR-HenriNeural",             # Homme 1 (Grave, narratif)
-    "fr-FR-RemyNeural",              # Homme 2 (Médium, naturel)
-    "fr-CA-AntoineNeural",           # Homme 3 (Dynamique)
-    "fr-BE-GerardNeural"             # Homme 4 (Posé)
+    "fr-FR-HenriNeural",                 # Homme 1 (Grave, narratif)
+    "fr-FR-RemyMultilingualNeural",      # Homme 2 (Médium, naturel)
+    "fr-CA-AntoineNeural",               # Homme 3 (Dynamique)
+    "fr-BE-GerardNeural"                 # Homme 4 (Posé)
 ]
 
 VOIX_FEMMES = [
-    "fr-FR-DeniseNeural",            # Femme 1 (Douce, naturelle)
-    "fr-FR-EloiseNeural",            # Femme 2 (Claire, vive)
-    "fr-FR-VivienneMultilingualNeural", # Femme 3 (Conversationnelle)
-    "fr-BE-CharlineNeural"           # Femme 4 (Chaleureuse)
+    "fr-FR-DeniseNeural",                # Femme 1 (Douce, claire)
+    "fr-FR-EloiseNeural",                # Femme 2 (Dynamique, vive)
+    "fr-FR-VivienneMultilingualNeural",  # Femme 3 (Conversationnelle)
+    "fr-BE-CharlineNeural"               # Femme 4 (Chaleureuse)
 ]
 
 # ---------------------------------------------------------
@@ -57,6 +58,63 @@ def reinitialiser_tout():
     st.session_state.map_voix = {}
 
 # ---------------------------------------------------------
+# FONCTIONS DE NETTOYAGE & D'AÉRATION TYPOGRAPHIQUE
+# ---------------------------------------------------------
+def aérer_et_structurer_texte(texte: str) -> str:
+    """Harmonise les retours à la ligne pour offrir des paragraphes aérés et lisibles."""
+    if not texte:
+        return ""
+    # Suppression des astérisques Markdown et soulignés parasites
+    texte = texte.replace("*", "").replace("_", "")
+    # Remplacement des sauts de ligne excessifs par un double saut standard
+    texte = re.sub(r'\r\n', '\n', texte)
+    texte = re.sub(r'\n{3,}', '\n\n', texte)
+    # Suppression des espaces horizontaux multiples
+    texte = re.sub(r'[ \t]+', ' ', texte)
+    return texte.strip()
+
+def nettoyer_texte_pour_audio(texte: str) -> str:
+    """Élimine tous les artefacts nuisibles à la prononciation du moteur Edge-TTS."""
+    if not texte:
+        return ""
+    # 1. Correction du bug de lecture horaire (ex: 38:4 -> 38, 4)
+    texte = re.sub(r'(\d+):(\d+)', r'\1, \2', texte)
+    # 2. Suppression totale des balises et symboles Markdown
+    texte = texte.replace("*", "").replace("#", "").replace("_", "")
+    # 3. Normalisation des tirets cadratins en virgules pour une pause orale naturelle
+    texte = re.sub(r'\s*[-—–]\s*', ', ', texte)
+    # 4. Harmonisation des guillemets
+    texte = texte.replace("«", '"').replace("»", '"').replace("“", '"').replace("”", '"')
+    # 5. Espaces et ponctuation
+    texte = re.sub(r'\s+([.,!?:;])', r'\1', texte)
+    texte = re.sub(r'[ \t]+', ' ', texte)
+    return texte.strip()
+
+def decouper_texte_en_phrases(texte: str, max_chars: int = 1400) -> list:
+    """Découpe les longues répliques en sous-blocs digestes pour ne jamais saturer Edge-TTS."""
+    # On commence par respecter les paragraphes s'ils existent
+    paragraphes = [p.strip() for p in texte.split("\n\n") if p.strip()]
+    morceaux_finaux = []
+
+    for para in paragraphes:
+        if len(para) <= max_chars:
+            morceaux_finaux.append(para)
+        else:
+            phrases = re.split(r'([.!?]+(?:\s+|$))', para)
+            buffer = ""
+            for part in phrases:
+                if len(buffer) + len(part) <= max_chars:
+                    buffer += part
+                else:
+                    if buffer.strip():
+                        morceaux_finaux.append(buffer.strip())
+                    buffer = part
+            if buffer.strip():
+                morceaux_finaux.append(buffer.strip())
+
+    return morceaux_finaux
+
+# ---------------------------------------------------------
 # ÉTAPE 2 : TRANSCRIPTION & DIARISATION (VO)
 # ---------------------------------------------------------
 def transcrire_et_diariser(chemin_audio: str, api_key: str, contexte: str):
@@ -67,14 +125,15 @@ def transcrire_et_diariser(chemin_audio: str, api_key: str, contexte: str):
 
     prompt = f"""
     Tu es un ingénieur du son et transcripteur professionnel.
-    Voici le contexte du podcast (titre, invités potentiels, sujet) :
+    Voici le contexte de l'émission :
     \"\"\"{contexte}\"\"\"
 
-    CONSIGNES :
+    CONSIGNES CRITIQUES :
     1. Transcris fidèlement la parole en découpant par tour de rôle (diarisation).
-    2. Identifie qui parle en t'aidant de la description fournie (ex: "Lex Fridman", "Sam Altman", ou "Animateur").
+    2. Identifie qui parle en t'aidant de la description fournie (ex: "Donald Miller", "Voix off", "Invité").
     3. Détermine le genre de chaque locuteur : strictement "masculin" ou "feminin".
-    4. Rédige les propos originaux dans 'texte_original'.
+    4. STRUCTURE ET AÉRATION : Si une prise de parole est longue, aère-la impérativement en plusieurs paragraphes distincts séparés par un double saut de ligne (\\n\\n). N'aplatis JAMAIS une longue intervention en un bloc compact continu.
+    5. N'utilise AUCUN balisage Markdown (pas d'astérisques *, pas de dièses #).
 
     FORMAT DE SORTIE REQUIS (JSON pur uniquement) :
     [
@@ -82,7 +141,7 @@ def transcrire_et_diariser(chemin_audio: str, api_key: str, contexte: str):
         "speaker_id": "Speaker 1",
         "nom_locuteur": "Nom de la personne",
         "genre": "masculin",
-        "texte_original": "Paroles prononcées en anglais..."
+        "texte_original": "Paroles prononcées en anglais aérées avec des \\n\\n..."
       }}
     ]
     """
@@ -102,38 +161,43 @@ def transcrire_et_diariser(chemin_audio: str, api_key: str, contexte: str):
     except Exception:
         pass
 
-    return json.loads(reponse.text)
+    donnees = json.loads(reponse.text)
+    for seg in donnees:
+        seg["texte_original"] = aérer_et_structurer_texte(seg.get("texte_original", ""))
+    return donnees
 
 # ---------------------------------------------------------
-# ÉTAPE 3 : TRADUCTION STRUCTURÉE (VF)
+# ÉTAPE 3 : TRADUCTION STRUCTURÉE & AÉRÉE (VF)
 # ---------------------------------------------------------
 def traduire_dialogue(script_vo, api_key: str):
     client = genai.Client(api_key=api_key)
 
     prompt = f"""
-    Tu es un adaptateur et traducteur professionnel pour le doublage audiovisuel.
+    Tu es un adaptateur et traducteur littéraire pour le doublage audiovisuel.
     Traduis chaque réplique du dialogue suivant de l'anglais vers un français parlé fluide, naturel et élégant.
 
-    CONSIGNES STRICTES :
-    - Conserve exactement les mêmes locuteurs et la même structure JSON.
-    - Le champ 'texte_fr' doit contenir UNIQUEMENT ce que la personne dit. Ne mets JAMAIS le nom de la personne, ni "Monsieur X :", ni astérisques Markdown (*) dans ce champ.
-    
-    DIALOGUE À TRADUIRE :
+    CONSIGNES STRICTES DE STRUCTURE ET FORMATAGE :
+    1. CONSERVE OU RENFORCE L'AÉRATION : chaque longue réplique doit être structurée en paragraphes aérés, séparés par un double saut de ligne (\\n\\n). N'aplatis JAMAIS le texte en un seul bloc indigeste.
+    2. ZÉRO POLLUTION : Le champ 'texte_fr' doit contenir UNIQUEMENT les paroles prononcées par l'intervenant. Ne rajoute JAMAIS le nom de la personne, ni "Monsieur X :", ni introduction, ni conclusion.
+    3. ZÉRO MARKDOWN : N'utilise AUCUN astérisque (* ou **), AUCUN dièse (#), AUCUN souligné (_).
+    4. Références et chiffres : écris les références clairement sans symboles ambigus.
+
+    DIALOGUE SOURCE :
     {json.dumps(script_vo, ensure_ascii=False)}
 
-    FORMAT DE SORTIE ATTENDU (JSON pur uniquement) :
+    FORMAT DE SORTIE REQUIS (JSON pur uniquement) :
     [
       {{
         "speaker_id": "Speaker 1",
         "nom_locuteur": "Nom de la personne",
         "genre": "masculin",
         "texte_original": "...",
-        "texte_fr": "Traduction orale fluide en français..."
+        "texte_fr": "Premier paragraphe traduit.\\n\\nDeuxième paragraphe bien aéré..."
       }}
     ]
     """
 
-    with st.spinner("Traduction du dialogue en français en cours..."):
+    with st.spinner("Traduction et structuration du dialogue en cours..."):
         reponse = client.models.generate_content(
             model='gemini-3.8-flash',
             contents=prompt,
@@ -143,21 +207,28 @@ def traduire_dialogue(script_vo, api_key: str):
             )
         )
 
-    return json.loads(reponse.text)
+    donnees = json.loads(reponse.text)
+    for seg in donnees:
+        seg["texte_fr"] = aérer_et_structurer_texte(seg.get("texte_fr", ""))
+    return donnees
 
 # ---------------------------------------------------------
-# ÉTAPE 4 : SYNTHÈSE VOCALE MULTI-VOIX VIA FFMPEG
+# ÉTAPE 4 : SYNTHÈSE VOCALE SÉCURISÉE MULTI-VOIX
 # ---------------------------------------------------------
-async def generer_clip_audio(texte: str, voix: str, chemin_fichier: str):
-    comm = edge_tts.Communicate(texte, voix)
-    await comm.save(chemin_fichier)
+async def generer_clip_avec_secours(texte: str, voix_principale: str, voix_secours: str, chemin_sortie: str):
+    try:
+        comm = edge_tts.Communicate(texte, voix_principale)
+        await comm.save(chemin_sortie)
+    except Exception:
+        comm = edge_tts.Communicate(texte, voix_secours)
+        await comm.save(chemin_sortie)
 
 def orchestrer_synthese_vocale(script_vf):
     map_locuteurs_voix = {}
     index_h = 0
     index_f = 0
 
-    # 1. Attribution des voix selon le genre
+    # Attribution dynamique des voix
     for seg in script_vf:
         locuteur = seg["nom_locuteur"]
         genre = seg.get("genre", "masculin").lower()
@@ -170,11 +241,11 @@ def orchestrer_synthese_vocale(script_vf):
                 map_locuteurs_voix[locuteur] = VOIX_HOMMES[index_h % len(VOIX_HOMMES)]
                 index_h += 1
 
-    total = len(script_vf)
-    barre = st.progress(0, text="Initialisation de la synthèse vocale...")
+    total_repliques = len(script_vf)
+    barre = st.progress(0, text="Initialisation du studio audio...")
 
     with tempfile.TemporaryDirectory() as dossier_tmp:
-        # Fichier de silence (0.35s) généré avec ffmpeg
+        # Micro-pause de 0.35 s entre répliques
         chemin_silence = os.path.join(dossier_tmp, "silence.mp3")
         cmd_silence = [
             "ffmpeg", "-y", "-f", "lavfi",
@@ -185,32 +256,46 @@ def orchestrer_synthese_vocale(script_vf):
         subprocess.run(cmd_silence, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         fichiers_liste = []
+        compteur_morceau = 0
 
-        # Génération segment par segment
         for i, seg in enumerate(script_vf):
-            texte_a_lire = seg["texte_fr"].strip()
-            if not texte_a_lire:
+            texte_brut = seg["texte_fr"].strip()
+            if not texte_brut:
                 continue
 
-            voix = map_locuteurs_voix[seg["nom_locuteur"]]
-            clip_path = os.path.join(dossier_tmp, f"replique_{i:04d}.mp3")
+            locuteur = seg["nom_locuteur"]
+            genre = seg.get("genre", "masculin").lower()
+            voix_voulue = map_locuteurs_voix[locuteur]
+            voix_secours = "fr-FR-HenriNeural" if genre != "feminin" else "fr-FR-DeniseNeural"
 
-            asyncio.run(generer_clip_audio(texte_a_lire, voix, clip_path))
+            pct = int((i / total_repliques) * 100)
+            barre.progress(pct, text=f"Enregistrement de {locuteur} ({i + 1}/{total_repliques})...")
 
-            # Ajout de la réplique et du micro-silence
-            fichiers_liste.append(clip_path)
+            # Nettoyage phonétique préalable
+            texte_purifie = nettoyer_texte_pour_audio(texte_brut)
+
+            # Découpage préventif anti-surchauffe WebSocket
+            sous_morceaux = decouper_texte_en_phrases(texte_purifie, max_chars=1400)
+
+            for sous_bloc in sous_morceaux:
+                if not sous_bloc.strip():
+                    continue
+                clip_path = os.path.join(dossier_tmp, f"part_{compteur_morceau:05d}.mp3")
+                asyncio.run(generer_clip_avec_secours(sous_bloc, voix_voulue, voix_secours, clip_path))
+                fichiers_liste.append(clip_path)
+                compteur_morceau += 1
+
+            # Pause naturelle avant le changement d'interlocuteur
             fichiers_liste.append(chemin_silence)
 
-            pct = int(((i + 1) / total) * 100)
-            barre.progress(pct, text=f"Voix de {seg['nom_locuteur']} ({i + 1}/{total})...")
+        barre.progress(100, text="Assemblage et finalisation du podcast complet...")
 
-        # Fichier concat list pour ffmpeg
+        # Concaténation ffmpeg
         concat_txt = os.path.join(dossier_tmp, "concat_list.txt")
         with open(concat_txt, "w", encoding="utf-8") as f:
             for item in fichiers_liste:
                 f.write(f"file '{item}'\n")
 
-        # Fusion sans ré-encodage via ffmpeg
         fichier_mp3_final = os.path.join(dossier_tmp, "podcast_vf_complet.mp3")
         cmd_concat = [
             "ffmpeg", "-y", "-f", "concat",
@@ -229,10 +314,9 @@ def orchestrer_synthese_vocale(script_vf):
 # ---------------------------------------------------------
 def main():
     st.title("🎙️ CastMorph - Doublage Automatique de Podcasts")
-    st.markdown("Importez un enregistrement audio pour générer une version française intégrale avec attribution de voix différenciées par locuteur.")
+    st.markdown("Pipeline haute fidélité : Transcription Diarisée • Traduction Aérée • Synthèse Vocale Multi-Voix HD.")
     st.divider()
 
-    # Barre latérale : Clé API & Réinitialisation
     with st.sidebar:
         st.header("⚙️ Paramètres")
         cle_automatique = st.secrets.get("GOOGLE_API_KEY", "")
@@ -243,7 +327,7 @@ def main():
             st.rerun()
 
     # -----------------------------------------------------
-    # ÉTAPE 1 : IMPORTATION DU FICHIER AUDIO
+    # ÉTAPE 1 : IMPORTATION AUDIO
     # -----------------------------------------------------
     st.subheader("Étape 1 : Importer la Piste Audio")
     
@@ -253,9 +337,9 @@ def main():
     )
 
     contexte_manuel = st.text_area(
-        "Contexte de l'émission (Facultatif - Titre, nom des invités pour aider l'IA) :",
-        placeholder="Ex: Épisode avec Sam Altman et Lex Fridman parlant d'intelligence artificielle...",
-        height=100
+        "Contexte de l'émission (Facultatif - Titre, invités pour guider l'IA) :",
+        placeholder="Ex: Épisode avec Donald Miller sur les 5 formules marketing StoryBrand...",
+        height=80
     )
 
     if fichier_upload is not None:
@@ -290,28 +374,29 @@ def main():
                 except Exception as e:
                     st.error(f"Erreur de transcription : {str(e)}")
 
-        # Affichage et Téléchargement de la VO
         if st.session_state.script_vo:
-            with st.expander("👁️ Voir la transcription originale (Anglais)", expanded=False):
-                texte_vo = ""
+            with st.expander("👁️ Voir la transcription originale aérée (Anglais)", expanded=False):
+                texte_export_vo = ""
                 for rep in st.session_state.script_vo:
-                    ligne = f"[{rep['nom_locuteur']} ({rep['genre']})] : {rep['texte_original']}\n\n"
-                    texte_vo += ligne
-                    st.markdown(f"**{rep['nom_locuteur']}** ({rep['genre']}) : {rep['texte_original']}")
+                    st.markdown(f"### 🎙️ {rep['nom_locuteur']} ({rep['genre']})")
+                    paragraphes = rep['texte_original'].split("\n\n")
+                    for p in paragraphes:
+                        st.write(p)
+                    texte_export_vo += f"[{rep['nom_locuteur']} ({rep['genre']})]\n{rep['texte_original']}\n\n" + ("-" * 40) + "\n\n"
 
             st.download_button(
-                label="📄 Télécharger la Transcription originale (.txt)",
-                data=texte_vo,
+                label="📄 Télécharger la Transcription originale structurée (.txt)",
+                data=texte_export_vo,
                 file_name="transcription_originale_VO.txt",
                 mime="text/plain"
             )
 
     # -----------------------------------------------------
-    # ÉTAPE 3 : TRADUCTION FRANÇAISE (VF)
+    # ÉTAPE 3 : TRADUCTION STRUCTURÉE & AÉRÉE (VF)
     # -----------------------------------------------------
     if st.session_state.script_vo:
         st.divider()
-        st.subheader("Étape 3 : Traduction en Français")
+        st.subheader("Étape 3 : Traduction en Français (Paragraphes Aérés)")
 
         if st.button("🌐 Lancer la Traduction en Français", type="primary"):
             if not api_key.strip():
@@ -320,24 +405,25 @@ def main():
                 try:
                     vf = traduire_dialogue(st.session_state.script_vo, api_key)
                     st.session_state.script_vf = vf
-                    st.success("Traduction du dialogue terminée !")
+                    st.success("Traduction du dialogue structurée avec succès !")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erreur de traduction : {str(e)}")
 
-        # Affichage et Téléchargement de la VF
         if st.session_state.script_vf:
-            with st.expander("👁️ Voir le dialogue traduit (Français)", expanded=True):
-                texte_vf = ""
+            with st.expander("👁️ Consulter le script traduit et aéré (Français)", expanded=True):
+                texte_export_vf = ""
                 for rep in st.session_state.script_vf:
                     badge = "👨" if rep.get("genre") == "masculin" else "👩"
-                    ligne = f"[{rep['nom_locuteur']}] : {rep['texte_fr']}\n\n"
-                    texte_vf += ligne
-                    st.markdown(f"**{badge} {rep['nom_locuteur']}** : {rep['texte_fr']}")
+                    st.markdown(f"### {badge} {rep['nom_locuteur']}")
+                    paragraphes = rep['texte_fr'].split("\n\n")
+                    for p in paragraphes:
+                        st.write(p)
+                    texte_export_vf += f"[{rep['nom_locuteur']}]\n{rep['texte_fr']}\n\n" + ("-" * 40) + "\n\n"
 
             st.download_button(
-                label="📄 Télécharger le Script Traduit (.txt)",
-                data=texte_vf,
+                label="📄 Télécharger le Script Traduit & Aéré (.txt)",
+                data=texte_export_vf,
                 file_name="script_traduit_VF.txt",
                 mime="text/plain"
             )
@@ -354,12 +440,11 @@ def main():
                 audio_bytes, map_voix = orchestrer_synthese_vocale(st.session_state.script_vf)
                 st.session_state.audio_final_bytes = audio_bytes
                 st.session_state.map_voix = map_voix
-                st.success("Doublage vocal achevé !")
+                st.success("Podcast doublé avec succès !")
                 st.rerun()
             except Exception as e:
                 st.error(f"Erreur audio : {str(e)}")
 
-        # Lecteur et Téléchargement Audio MP3
         if st.session_state.audio_final_bytes:
             st.write("---")
             st.subheader("🔊 Résultat Final : Podcast Doublé")
@@ -367,8 +452,8 @@ def main():
             # Affichage de la distribution des voix
             cols = st.columns(len(st.session_state.map_voix))
             for i, (nom, voix) in enumerate(st.session_state.map_voix.items()):
-                nom_court = voix.split("-")[-1].replace("Neural", "")
-                cols[i].metric(label=nom, value=f"Voix {nom_court}")
+                nom_court = voix.split("-")[-1].replace("Neural", "").replace("Multilingual", " (Multi)")
+                cols[i].metric(label=nom, value=nom_court)
 
             st.audio(st.session_state.audio_final_bytes, format="audio/mp3")
 
