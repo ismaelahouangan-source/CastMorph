@@ -4,7 +4,6 @@ import json
 import asyncio
 import tempfile
 import subprocess
-import yt_dlp
 import edge_tts
 from google import genai
 from google.genai import types
@@ -13,7 +12,7 @@ from google.genai import types
 # CONFIGURATION DE LA PAGE & VOIX HD
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Studio de Doublage de Podcasts HD",
+    page_title="CastMorph - Doublage de Podcasts HD",
     page_icon="🎙️",
     layout="wide"
 )
@@ -58,52 +57,24 @@ def reinitialiser_tout():
     st.session_state.map_voix = {}
 
 # ---------------------------------------------------------
-# ÉTAPE 1 : EXTRACTION AUDIO DEPUIS L'URL (CLOUD)
-# ---------------------------------------------------------
-def extraire_audio_depuis_url(url: str):
-    dossier_temp = tempfile.mkdtemp()
-    
-    options_ydl = {
-        'format': 'bestaudio/best',
-        'outtmpl': os.path.join(dossier_temp, 'podcast_source.%(ext)s'),
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'quiet': True,
-        'no_warnings': True,
-    }
-
-    with yt_dlp.YoutubeDL(options_ydl) as ydl:
-        info = ydl.extract_info(url, download=True)
-        titre = info.get('title', 'Épisode inconnu')
-        description = info.get('description', '')
-        chemin_brut = ydl.prepare_filename(info)
-        chemin_mp3 = os.path.splitext(chemin_brut)[0] + ".mp3"
-
-    contexte = f"Titre : {titre}\nDescription : {description[:2000]}"
-    return chemin_mp3, contexte
-
-# ---------------------------------------------------------
 # ÉTAPE 2 : TRANSCRIPTION & DIARISATION (VO)
 # ---------------------------------------------------------
 def transcrire_et_diariser(chemin_audio: str, api_key: str, contexte: str):
     client = genai.Client(api_key=api_key)
 
-    with st.spinner("Envoi de la piste audio aux serveurs IA..."):
+    with st.spinner("Téléversement et analyse audio par Gemini..."):
         audio_file = client.files.upload(file=chemin_audio)
 
     prompt = f"""
     Tu es un ingénieur du son et transcripteur professionnel.
-    Voici le contexte du podcast (titre et description de l'émission) :
+    Voici le contexte du podcast (titre, invités potentiels, sujet) :
     \"\"\"{contexte}\"\"\"
 
     CONSIGNES :
-    1. Transcris l'intégralité de l'audio en découpant fidèlement par tour de parole (diarisation).
-    2. Identifie qui parle en t'aidant du contexte (ex: "Lex Fridman", "Invité", ou "Animateur").
-    3. Détermine le genre de chaque intervenant : strictement "masculin" ou "feminin".
-    4. Rédige le texte original parlé dans 'texte_original'.
+    1. Transcris fidèlement la parole en découpant par tour de rôle (diarisation).
+    2. Identifie qui parle en t'aidant de la description fournie (ex: "Lex Fridman", "Sam Altman", ou "Animateur").
+    3. Détermine le genre de chaque locuteur : strictement "masculin" ou "feminin".
+    4. Rédige les propos originaux dans 'texte_original'.
 
     FORMAT DE SORTIE REQUIS (JSON pur uniquement) :
     [
@@ -186,7 +157,7 @@ def orchestrer_synthese_vocale(script_vf):
     index_h = 0
     index_f = 0
 
-    # 1. Attribution des voix par genre
+    # 1. Attribution des voix selon le genre
     for seg in script_vf:
         locuteur = seg["nom_locuteur"]
         genre = seg.get("genre", "masculin").lower()
@@ -226,7 +197,7 @@ def orchestrer_synthese_vocale(script_vf):
 
             asyncio.run(generer_clip_audio(texte_a_lire, voix, clip_path))
 
-            # Ajout de la réplique puis d'une pause
+            # Ajout de la réplique et du micro-silence
             fichiers_liste.append(clip_path)
             fichiers_liste.append(chemin_silence)
 
@@ -257,8 +228,8 @@ def orchestrer_synthese_vocale(script_vf):
 # INTERFACE PRINCIPALE STREAMLIT
 # ---------------------------------------------------------
 def main():
-    st.title("🎙️ Studio de Doublage Automatique de Podcasts")
-    st.markdown("Collez l'URL publique d'un podcast (**YouTube, Spotify, etc.**) pour extraire l'audio, transcrire, traduire et synthétiser avec des voix différenciées.")
+    st.title("🎙️ CastMorph - Doublage Automatique de Podcasts")
+    st.markdown("Importez un enregistrement audio pour générer une version française intégrale avec attribution de voix différenciées par locuteur.")
     st.divider()
 
     # Barre latérale : Clé API & Réinitialisation
@@ -272,26 +243,29 @@ def main():
             st.rerun()
 
     # -----------------------------------------------------
-    # ÉTAPE 1 : EXTRACTION DEPUIS L'URL
+    # ÉTAPE 1 : IMPORTATION DU FICHIER AUDIO
     # -----------------------------------------------------
-    st.subheader("Étape 1 : Récupérer le Podcast depuis l'URL")
-    url_podcast = st.text_input(
-        "Lien public du podcast (YouTube ou Spotify) :",
-        placeholder="https://open.spotify.com/episode/... ou https://www.youtube.com/watch?v=..."
+    st.subheader("Étape 1 : Importer la Piste Audio")
+    
+    fichier_upload = st.file_uploader(
+        "Sélectionnez le fichier audio du podcast (Anglais) :",
+        type=["mp3", "wav", "m4a", "aac", "ogg"]
     )
 
-    if st.button("📥 Télécharger et préparer l'audio dans le Cloud", type="primary"):
-        if not url_podcast.strip():
-            st.error("Veuillez coller une URL valide.")
-        else:
-            try:
-                chemin_mp3, contexte = extraire_audio_depuis_url(url_podcast)
-                st.session_state.chemin_audio = chemin_mp3
-                st.session_state.contexte_info = contexte
-                st.success("Audio extrait avec succès sur le serveur !")
-                st.info(contexte.split("\n")[0])
-            except Exception as e:
-                st.error(f"Erreur d'extraction : {str(e)}")
+    contexte_manuel = st.text_area(
+        "Contexte de l'émission (Facultatif - Titre, nom des invités pour aider l'IA) :",
+        placeholder="Ex: Épisode avec Sam Altman et Lex Fridman parlant d'intelligence artificielle...",
+        height=100
+    )
+
+    if fichier_upload is not None:
+        if st.session_state.chemin_audio is None:
+            extension = os.path.splitext(fichier_upload.name)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_f:
+                temp_f.write(fichier_upload.read())
+                st.session_state.chemin_audio = temp_f.name
+                st.session_state.contexte_info = f"Fichier : {fichier_upload.name}\n{contexte_manuel}"
+            st.success(f"Fichier « {fichier_upload.name} » prêt pour l'analyse.")
 
     # -----------------------------------------------------
     # ÉTAPE 2 : TRANSCRIPTION & DIARISATION (VO)
@@ -300,9 +274,9 @@ def main():
         st.divider()
         st.subheader("Étape 2 : Transcription & Identification des Intervenants (VO)")
 
-        if st.button("📝 Lancer la Transcription & Diarisation"):
+        if st.button("📝 Lancer la Transcription & Diarisation", type="primary"):
             if not api_key.strip():
-                st.error("Veuillez renseigner votre clé API Gemini dans le panneau latéral.")
+                st.error("Veuillez renseigner votre clé API Gemini dans le menu latéral.")
             else:
                 try:
                     vo = transcrire_et_diariser(
@@ -311,7 +285,7 @@ def main():
                         st.session_state.contexte_info
                     )
                     st.session_state.script_vo = vo
-                    st.success(f"{len(vo)} répliques détectées avec identification des intervenants !")
+                    st.success(f"{len(vo)} prises de parole identifiées !")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erreur de transcription : {str(e)}")
@@ -319,15 +293,15 @@ def main():
         # Affichage et Téléchargement de la VO
         if st.session_state.script_vo:
             with st.expander("👁️ Voir la transcription originale (Anglais)", expanded=False):
-                texte_texte_vo = ""
+                texte_vo = ""
                 for rep in st.session_state.script_vo:
                     ligne = f"[{rep['nom_locuteur']} ({rep['genre']})] : {rep['texte_original']}\n\n"
-                    texte_texte_vo += ligne
+                    texte_vo += ligne
                     st.markdown(f"**{rep['nom_locuteur']}** ({rep['genre']}) : {rep['texte_original']}")
 
             st.download_button(
                 label="📄 Télécharger la Transcription originale (.txt)",
-                data=texte_texte_vo,
+                data=texte_vo,
                 file_name="transcription_originale_VO.txt",
                 mime="text/plain"
             )
@@ -339,14 +313,14 @@ def main():
         st.divider()
         st.subheader("Étape 3 : Traduction en Français")
 
-        if st.button("🌐 Lancer la Traduction en Français"):
+        if st.button("🌐 Lancer la Traduction en Français", type="primary"):
             if not api_key.strip():
                 st.error("Clé API requise.")
             else:
                 try:
                     vf = traduire_dialogue(st.session_state.script_vo, api_key)
                     st.session_state.script_vf = vf
-                    st.success("Traduction effectuée !")
+                    st.success("Traduction du dialogue terminée !")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erreur de traduction : {str(e)}")
@@ -354,16 +328,16 @@ def main():
         # Affichage et Téléchargement de la VF
         if st.session_state.script_vf:
             with st.expander("👁️ Voir le dialogue traduit (Français)", expanded=True):
-                texte_texte_vf = ""
+                texte_vf = ""
                 for rep in st.session_state.script_vf:
                     badge = "👨" if rep.get("genre") == "masculin" else "👩"
                     ligne = f"[{rep['nom_locuteur']}] : {rep['texte_fr']}\n\n"
-                    texte_texte_vf += ligne
+                    texte_vf += ligne
                     st.markdown(f"**{badge} {rep['nom_locuteur']}** : {rep['texte_fr']}")
 
             st.download_button(
                 label="📄 Télécharger le Script Traduit (.txt)",
-                data=texte_texte_vf,
+                data=texte_vf,
                 file_name="script_traduit_VF.txt",
                 mime="text/plain"
             )
@@ -380,7 +354,7 @@ def main():
                 audio_bytes, map_voix = orchestrer_synthese_vocale(st.session_state.script_vf)
                 st.session_state.audio_final_bytes = audio_bytes
                 st.session_state.map_voix = map_voix
-                st.success("Livre/Podcast audio généré avec succès !")
+                st.success("Doublage vocal achevé !")
                 st.rerun()
             except Exception as e:
                 st.error(f"Erreur audio : {str(e)}")
@@ -390,7 +364,7 @@ def main():
             st.write("---")
             st.subheader("🔊 Résultat Final : Podcast Doublé")
             
-            # Affichage des voix associées
+            # Affichage de la distribution des voix
             cols = st.columns(len(st.session_state.map_voix))
             for i, (nom, voix) in enumerate(st.session_state.map_voix.items()):
                 nom_court = voix.split("-")[-1].replace("Neural", "")
@@ -399,7 +373,7 @@ def main():
             st.audio(st.session_state.audio_final_bytes, format="audio/mp3")
 
             st.download_button(
-                label="⬇️ Télécharger le Podcast Audio Complet (.mp3)",
+                label="⬇️ Télécharger le Podcast Doublé Complet (.mp3)",
                 data=st.session_state.audio_final_bytes,
                 file_name="podcast_vf_multi_voix.mp3",
                 mime="audio/mp3",
