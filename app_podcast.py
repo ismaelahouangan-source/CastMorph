@@ -34,6 +34,33 @@ VOIX_FEMMES = [
 ]
 
 # ---------------------------------------------------------
+# RÉCUPÉRATION ROBUSTE DU SECRET STREAMLIT
+# ---------------------------------------------------------
+def recuperer_cle_automatique() -> str:
+    """
+    Extrait automatiquement la clé API depuis secrets.toml / Streamlit Cloud Secrets.
+    Prend en charge GOOGLE_API_KEY (clé unique) ou GOOGLE_API_KEYS (liste).
+    """
+    cle = ""
+    # 1. Vérification clé unique
+    if "GOOGLE_API_KEY" in st.secrets:
+        cle = str(st.secrets["GOOGLE_API_KEY"])
+    # 2. Vérification liste de clés
+    elif "GOOGLE_API_KEYS" in st.secrets:
+        liste_cles = st.secrets["GOOGLE_API_KEYS"]
+        if isinstance(liste_cles, (list, tuple)) and len(liste_cles) > 0:
+            cle = str(liste_cles[0])
+    
+    # Nettoyage des résidus éventuels (guillemets, antislashes, espaces)
+    return (
+        cle.replace(r'\_', '_')
+        .replace('\\', '')
+        .strip()
+        .strip('"')
+        .strip("'")
+    )
+
+# ---------------------------------------------------------
 # INITIALISATION DE LA MÉMOIRE (SESSION STATE)
 # ---------------------------------------------------------
 if "chemin_audio" not in st.session_state:
@@ -64,12 +91,9 @@ def aérer_et_structurer_texte(texte: str) -> str:
     """Harmonise les retours à la ligne pour offrir des paragraphes aérés et lisibles."""
     if not texte:
         return ""
-    # Suppression des astérisques Markdown et soulignés parasites
     texte = texte.replace("*", "").replace("_", "")
-    # Remplacement des sauts de ligne excessifs par un double saut standard
     texte = re.sub(r'\r\n', '\n', texte)
     texte = re.sub(r'\n{3,}', '\n\n', texte)
-    # Suppression des espaces horizontaux multiples
     texte = re.sub(r'[ \t]+', ' ', texte)
     return texte.strip()
 
@@ -77,22 +101,16 @@ def nettoyer_texte_pour_audio(texte: str) -> str:
     """Élimine tous les artefacts nuisibles à la prononciation du moteur Edge-TTS."""
     if not texte:
         return ""
-    # 1. Correction du bug de lecture horaire (ex: 38:4 -> 38, 4)
     texte = re.sub(r'(\d+):(\d+)', r'\1, \2', texte)
-    # 2. Suppression totale des balises et symboles Markdown
     texte = texte.replace("*", "").replace("#", "").replace("_", "")
-    # 3. Normalisation des tirets cadratins en virgules pour une pause orale naturelle
     texte = re.sub(r'\s*[-—–]\s*', ', ', texte)
-    # 4. Harmonisation des guillemets
     texte = texte.replace("«", '"').replace("»", '"').replace("“", '"').replace("”", '"')
-    # 5. Espaces et ponctuation
     texte = re.sub(r'\s+([.,!?:;])', r'\1', texte)
     texte = re.sub(r'[ \t]+', ' ', texte)
     return texte.strip()
 
 def decouper_texte_en_phrases(texte: str, max_chars: int = 1400) -> list:
     """Découpe les longues répliques en sous-blocs digestes pour ne jamais saturer Edge-TTS."""
-    # On commence par respecter les paragraphes s'ils existent
     paragraphes = [p.strip() for p in texte.split("\n\n") if p.strip()]
     morceaux_finaux = []
 
@@ -118,7 +136,7 @@ def decouper_texte_en_phrases(texte: str, max_chars: int = 1400) -> list:
 # ÉTAPE 2 : TRANSCRIPTION & DIARISATION (VO)
 # ---------------------------------------------------------
 def transcrire_et_diariser(chemin_audio: str, api_key: str, contexte: str):
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key.strip())
 
     with st.spinner("Téléversement et analyse audio par Gemini..."):
         audio_file = client.files.upload(file=chemin_audio)
@@ -170,7 +188,7 @@ def transcrire_et_diariser(chemin_audio: str, api_key: str, contexte: str):
 # ÉTAPE 3 : TRADUCTION STRUCTURÉE & AÉRÉE (VF)
 # ---------------------------------------------------------
 def traduire_dialogue(script_vo, api_key: str):
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key.strip())
 
     prompt = f"""
     Tu es un adaptateur et traducteur littéraire pour le doublage audiovisuel.
@@ -228,7 +246,6 @@ def orchestrer_synthese_vocale(script_vf):
     index_h = 0
     index_f = 0
 
-    # Attribution dynamique des voix
     for seg in script_vf:
         locuteur = seg["nom_locuteur"]
         genre = seg.get("genre", "masculin").lower()
@@ -245,7 +262,6 @@ def orchestrer_synthese_vocale(script_vf):
     barre = st.progress(0, text="Initialisation du studio audio...")
 
     with tempfile.TemporaryDirectory() as dossier_tmp:
-        # Micro-pause de 0.35 s entre répliques
         chemin_silence = os.path.join(dossier_tmp, "silence.mp3")
         cmd_silence = [
             "ffmpeg", "-y", "-f", "lavfi",
@@ -271,10 +287,7 @@ def orchestrer_synthese_vocale(script_vf):
             pct = int((i / total_repliques) * 100)
             barre.progress(pct, text=f"Enregistrement de {locuteur} ({i + 1}/{total_repliques})...")
 
-            # Nettoyage phonétique préalable
             texte_purifie = nettoyer_texte_pour_audio(texte_brut)
-
-            # Découpage préventif anti-surchauffe WebSocket
             sous_morceaux = decouper_texte_en_phrases(texte_purifie, max_chars=1400)
 
             for sous_bloc in sous_morceaux:
@@ -285,12 +298,10 @@ def orchestrer_synthese_vocale(script_vf):
                 fichiers_liste.append(clip_path)
                 compteur_morceau += 1
 
-            # Pause naturelle avant le changement d'interlocuteur
             fichiers_liste.append(chemin_silence)
 
         barre.progress(100, text="Assemblage et finalisation du podcast complet...")
 
-        # Concaténation ffmpeg
         concat_txt = os.path.join(dossier_tmp, "concat_list.txt")
         with open(concat_txt, "w", encoding="utf-8") as f:
             for item in fichiers_liste:
@@ -317,11 +328,22 @@ def main():
     st.markdown("Pipeline haute fidélité : Transcription Diarisée • Traduction Aérée • Synthèse Vocale Multi-Voix HD.")
     st.divider()
 
+    # Lecture automatique du Secret Streamlit
+    cle_detectee = recuperer_cle_automatique()
+
     with st.sidebar:
         st.header("⚙️ Paramètres")
-        cle_automatique = st.secrets.get("GOOGLE_API_KEY", "")
-        api_key = st.text_input("Clé API Google Gemini :", value=cle_automatique, type="password")
-        
+        api_key = st.text_input(
+            "Clé API Google Gemini :",
+            value=cle_detectee,
+            type="password",
+            placeholder="AIzaSy... ou AQ..."
+        )
+        if cle_detectee:
+            st.success(" Clé API détectée automatiquement depuis les Secrets.")
+        else:
+            st.warning(" Aucune clé trouvée dans les Secrets. Renseignez-la ci-dessus.")
+
         if st.button("🔄 Nouveau Podcast / Réinitialiser", use_container_width=True):
             reinitialiser_tout()
             st.rerun()
@@ -449,7 +471,6 @@ def main():
             st.write("---")
             st.subheader("🔊 Résultat Final : Podcast Doublé")
             
-            # Affichage de la distribution des voix
             cols = st.columns(len(st.session_state.map_voix))
             for i, (nom, voix) in enumerate(st.session_state.map_voix.items()):
                 nom_court = voix.split("-")[-1].replace("Neural", "").replace("Multilingual", " (Multi)")
