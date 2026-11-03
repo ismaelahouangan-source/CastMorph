@@ -42,16 +42,13 @@ def recuperer_cle_automatique() -> str:
     Prend en charge GOOGLE_API_KEY (clé unique) ou GOOGLE_API_KEYS (liste).
     """
     cle = ""
-    # 1. Vérification clé unique
     if "GOOGLE_API_KEY" in st.secrets:
         cle = str(st.secrets["GOOGLE_API_KEY"])
-    # 2. Vérification liste de clés
     elif "GOOGLE_API_KEYS" in st.secrets:
         liste_cles = st.secrets["GOOGLE_API_KEYS"]
         if isinstance(liste_cles, (list, tuple)) and len(liste_cles) > 0:
             cle = str(liste_cles[0])
     
-    # Nettoyage des résidus éventuels (guillemets, antislashes, espaces)
     return (
         cle.replace(r'\_', '_')
         .replace('\\', '')
@@ -328,7 +325,6 @@ def main():
     st.markdown("Pipeline haute fidélité : Transcription Diarisée • Traduction Aérée • Synthèse Vocale Multi-Voix HD.")
     st.divider()
 
-    # Lecture automatique du Secret Streamlit
     cle_detectee = recuperer_cle_automatique()
 
     with st.sidebar:
@@ -340,17 +336,15 @@ def main():
             placeholder="AIzaSy... ou AQ..."
         )
         if cle_detectee:
-            st.success(" Clé API détectée automatiquement depuis les Secrets.")
+            st.success("Clé API active.")
         else:
-            st.warning(" Aucune clé trouvée dans les Secrets. Renseignez-la ci-dessus.")
+            st.warning("Renseignez votre clé API ci-dessus.")
 
         if st.button("🔄 Nouveau Podcast / Réinitialiser", use_container_width=True):
             reinitialiser_tout()
             st.rerun()
 
-    # -----------------------------------------------------
-    # ÉTAPE 1 : IMPORTATION AUDIO
-    # -----------------------------------------------------
+    # Étape 1 : Fichier source
     st.subheader("Étape 1 : Importer la Piste Audio")
     
     fichier_upload = st.file_uploader(
@@ -373,9 +367,7 @@ def main():
                 st.session_state.contexte_info = f"Fichier : {fichier_upload.name}\n{contexte_manuel}"
             st.success(f"Fichier « {fichier_upload.name} » prêt pour l'analyse.")
 
-    # -----------------------------------------------------
-    # ÉTAPE 2 : TRANSCRIPTION & DIARISATION (VO)
-    # -----------------------------------------------------
+    # Étape 2 : Transcription VO
     if st.session_state.chemin_audio:
         st.divider()
         st.subheader("Étape 2 : Transcription & Identification des Intervenants (VO)")
@@ -413,9 +405,7 @@ def main():
                 mime="text/plain"
             )
 
-    # -----------------------------------------------------
-    # ÉTAPE 3 : TRADUCTION STRUCTURÉE & AÉRÉE (VF)
-    # -----------------------------------------------------
+    # Étape 3 : Traduction VF
     if st.session_state.script_vo:
         st.divider()
         st.subheader("Étape 3 : Traduction en Français (Paragraphes Aérés)")
@@ -450,9 +440,7 @@ def main():
                 mime="text/plain"
             )
 
-    # -----------------------------------------------------
-    # ÉTAPE 4 : SYNTHÈSE VOCALE MULTI-VOIX
-    # -----------------------------------------------------
+    # Étape 4 : Synthèse Multi-Voix
     if st.session_state.script_vf:
         st.divider()
         st.subheader("Étape 4 : Synthèse Vocale HD (Multi-Voix)")
@@ -471,10 +459,14 @@ def main():
             st.write("---")
             st.subheader("🔊 Résultat Final : Podcast Doublé")
             
-            cols = st.columns(len(st.session_state.map_voix))
-            for i, (nom, voix) in enumerate(st.session_state.map_voix.items()):
-                nom_court = voix.split("-")[-1].replace("Neural", "").replace("Multilingual", " (Multi)")
-                cols[i].metric(label=nom, value=nom_court)
+            # Affichage texte/markdown sans composant dynamique externe pour éviter tout bug de module
+            if st.session_state.map_voix:
+                st.markdown("**Distribution des voix attribuées :**")
+                resume_voix = " • ".join([
+                    f"**{nom}** : `{voix.split('-')[-1].replace('Neural', '').replace('Multilingual', ' (Multi)')}`"
+                    for nom, voix in st.session_state.map_voix.items()
+                ])
+                st.info(resume_voix)
 
             st.audio(st.session_state.audio_final_bytes, format="audio/mp3")
 
