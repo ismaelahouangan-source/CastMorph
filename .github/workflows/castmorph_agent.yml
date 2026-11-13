@@ -1,0 +1,40 @@
+name: CastMorph Podcast Dubbing Agent
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dub-podcasts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer FFmpeg (Assemblage Audio)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer les dépendances Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lancer l'agent autonome CastMorph
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: python agent_podcast_drive.py
+
+      - name: Sauvegarder les résultats (Transcription, Traduction & MP3)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CastMorph-Podcasts-Resultats
+          path: output/
