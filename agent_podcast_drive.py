@@ -111,11 +111,25 @@ def decouper_texte_en_phrases(texte: str, max_chars: int = 1400) -> list:
     return morceaux_finaux
 
 # ---------------------------------------------------------
-# ÉTAPE 1 : TRANSCRIPTION & DIARISATION (VO)
+# ÉTAPE 1 : TRANSCRIPTION & DIARISATION (AVEC ATTENTE ACTIVE)
 # ---------------------------------------------------------
+def attendre_fichier_actif(audio_file):
+    """Attend que le fichier téléversé soit prêt (ACTIVE) sur les serveurs Google."""
+    while True:
+        info_fichier = client_gemini.files.get(name=audio_file.name)
+        etat = getattr(info_fichier.state, "name", str(info_fichier.state))
+        if "ACTIVE" in etat:
+            return info_fichier
+        if "FAILED" in etat:
+            raise RuntimeError(f"Échec du traitement interne du fichier audio par Google : {etat}")
+        print(f"     [Attente indexation Google : {etat}] Nouvelle vérification dans 3s...")
+        time.sleep(3)
+
 def transcrire_et_diariser(chemin_audio: str, contexte: str):
     print("  -> Téléversement de la piste audio vers Gemini...")
     audio_file = client_gemini.files.upload(file=chemin_audio)
+    audio_file = attendre_fichier_actif(audio_file)
+    time.sleep(2)
 
     prompt = f"""
     Tu es un ingénieur du son et transcripteur professionnel.
@@ -300,7 +314,7 @@ async def orchestrer_synthese_async(script_vf, chemin_mp3_final):
         shutil.rmtree(dossier_tmp, ignore_errors=True)
 
 # ---------------------------------------------------------
-# ORCHESTRATION GLOBALE
+# ORCHESTRATION GLOBALE RÉSILIENTE
 # ---------------------------------------------------------
 def executer_workflow():
     print("🎙️ Agent CastMorph démarré sur GitHub Actions.")
@@ -334,33 +348,38 @@ def executer_workflow():
             print(f"🎧 Traitement de : {nom_complet}")
             print(f"==================================================")
 
-            chemin_local_source = os.path.join(dossier_telechargement, f"source_{f['id']}{extension}")
-            telecharger_fichier_drive(service, f["id"], chemin_local_source)
-            print("  ✓ Fichier téléchargé depuis Google Drive.")
+            try:
+                chemin_local_source = os.path.join(dossier_telechargement, f"source_{f['id']}{extension}")
+                telecharger_fichier_drive(service, f["id"], chemin_local_source)
+                print("  ✓ Fichier téléchargé depuis Google Drive.")
 
-            contexte = f"Nom du fichier : {base_nom}\nDescription : {description_drive}"
-            script_vo = transcrire_et_diariser(chemin_local_source, contexte)
+                contexte = f"Nom du fichier : {base_nom}\nDescription : {description_drive}"
+                script_vo = transcrire_et_diariser(chemin_local_source, contexte)
 
-            texte_export_vo = ""
-            for rep in script_vo:
-                texte_export_vo += f"[{rep['nom_locuteur']} ({rep['genre']})]\n{rep['texte_original']}\n\n" + ("-" * 40) + "\n\n"
+                texte_export_vo = ""
+                for rep in script_vo:
+                    texte_export_vo += f"[{rep['nom_locuteur']} ({rep['genre']})]\n{rep['texte_original']}\n\n" + ("-" * 40) + "\n\n"
 
-            with open(chemin_vo, "w", encoding="utf-8") as f_vo:
-                f_vo.write(texte_export_vo.strip())
-            print(f"  ✓ Transcription VO sauvegardée : Transcription_VO_{base_nom}.txt")
+                with open(chemin_vo, "w", encoding="utf-8") as f_vo:
+                    f_vo.write(texte_export_vo.strip())
+                print(f"  ✓ Transcription VO sauvegardée : Transcription_VO_{base_nom}.txt")
 
-            script_vf = traduire_dialogue(script_vo)
+                script_vf = traduire_dialogue(script_vo)
 
-            texte_export_vf = ""
-            for rep in script_vf:
-                texte_export_vf += f"[{rep['nom_locuteur']}]\n{rep['texte_fr']}\n\n" + ("-" * 40) + "\n\n"
+                texte_export_vf = ""
+                for rep in script_vf:
+                    texte_export_vf += f"[{rep['nom_locuteur']}]\n{rep['texte_fr']}\n\n" + ("-" * 40) + "\n\n"
 
-            with open(chemin_vf, "w", encoding="utf-8") as f_vf:
-                f_vf.write(texte_export_vf.strip())
-            print(f"  ✓ Traduction VF sauvegardée : Traduction_VF_{base_nom}.txt")
+                with open(chemin_vf, "w", encoding="utf-8") as f_vf:
+                    f_vf.write(texte_export_vf.strip())
+                print(f"  ✓ Traduction VF sauvegardée : Traduction_VF_{base_nom}.txt")
 
-            asyncio.run(orchestrer_synthese_async(script_vf, chemin_mp3))
-            print(f"  ✓ Podcast doublé généré : Podcast_VF_{base_nom}.mp3\n")
+                asyncio.run(orchestrer_synthese_async(script_vf, chemin_mp3))
+                print(f"  ✓ Podcast doublé généré : Podcast_VF_{base_nom}.mp3\n")
+
+            except Exception as err_fichier:
+                print(f"  ❌ Erreur rencontrée sur « {nom_complet} » : {err_fichier}")
+                print("  ⏭️ Passage au fichier suivant...\n")
 
             time.sleep(3)
 
