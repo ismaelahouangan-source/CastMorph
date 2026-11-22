@@ -43,27 +43,45 @@ if not GOOGLE_API_KEY or not SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
 client_gemini = genai.Client(api_key=GOOGLE_API_KEY)
 
 # ---------------------------------------------------------
-# FONCTIONS GOOGLE DRIVE
+# FONCTIONS GOOGLE DRIVE (CONNEXION FRAÎCHE & RETRY)
 # ---------------------------------------------------------
 def get_drive_service():
+    """Crée une nouvelle instance Drive avec une connexion SSL fraîche."""
     info_compte = json.loads(SERVICE_ACCOUNT_JSON)
     creds = service_account.Credentials.from_service_account_info(info_compte, scopes=SCOPES)
-    return build("drive", "v3", credentials=creds)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def lister_audios_drive(service, folder_id):
+def lister_audios_drive(folder_id):
+    service = get_drive_service()
     requete = f"'{folder_id}' in parents and trashed = false"
-    resultats = service.files().list(q=requete, fields="files(id, name, description)").execute()
+    resultats = service.files().list(
+        q=requete,
+        pageSize=100,
+        fields="files(id, name, description)"
+    ).execute()
     fichiers = resultats.get("files", [])
     audios = [f for f in fichiers if f["name"].lower().endswith(EXTENSIONS_AUDIO)]
     return sorted(audios, key=lambda x: x["name"])
 
-def telecharger_fichier_drive(service, file_id, chemin_destination):
-    request = service.files().get_media(fileId=file_id)
-    with open(chemin_destination, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+def telecharger_fichier_drive_robuste(file_id, chemin_destination, max_essais=4):
+    """Télécharge le fichier avec réinitialisation de la connexion SSL en cas de Broken Pipe."""
+    for essai in range(1, max_essais + 1):
+        try:
+            # On recrée le client Drive à chaque tentative pour éviter les sockets expirés
+            service_frais = get_drive_service()
+            request = service_frais.files().get_media(fileId=file_id)
+            with open(chemin_destination, "wb") as fh:
+                downloader = MediaIoBaseDownload(fh, request, chunksize=5 * 1024 * 1024)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+            return
+        except Exception as err:
+            if essai == max_essais:
+                raise err
+            delai = essai * 4
+            print(f"     [Retry Drive {essai}/{max_essais}] Coupure réseau ({err}). Reconnexion dans {delai}s...")
+            time.sleep(delai)
 
 # ---------------------------------------------------------
 # NETTOYAGE, AÉRATION & DÉCOUPAGE
@@ -114,7 +132,6 @@ def decouper_texte_en_phrases(texte: str, max_chars: int = 1400) -> list:
 # ÉTAPE 1 : TRANSCRIPTION & DIARISATION (AVEC ATTENTE ACTIVE)
 # ---------------------------------------------------------
 def attendre_fichier_actif(audio_file):
-    """Attend que le fichier téléversé soit prêt (ACTIVE) sur les serveurs Google."""
     while True:
         info_fichier = client_gemini.files.get(name=audio_file.name)
         etat = getattr(info_fichier.state, "name", str(info_fichier.state))
@@ -127,7 +144,17 @@ def attendre_fichier_actif(audio_file):
 
 def transcrire_et_diariser(chemin_audio: str, contexte: str):
     print("  -> Téléversement de la piste audio vers Gemini...")
-    audio_file = client_gemini.files.upload(file=chemin_audio)
+    audio_file = None
+    for essai in range(1, 4):
+        try:
+            audio_file = client_gemini.files.upload(file=chemin_audio)
+            break
+        except Exception as err:
+            if essai == 3:
+                raise err
+            print(f"     [Retry Upload Gemini {essai}/3] {err}. Nouvel essai dans 5s...")
+            time.sleep(5)
+
     audio_file = attendre_fichier_actif(audio_file)
     time.sleep(2)
 
@@ -166,10 +193,11 @@ def transcrire_et_diariser(chemin_audio: str, contexte: str):
         )
         donnees = json.loads(reponse.text)
     finally:
-        try:
-            client_gemini.files.delete(name=audio_file.name)
-        except Exception:
-            pass
+        if audio_file:
+            try:
+                client_gemini.files.delete(name=audio_file.name)
+            except Exception:
+                pass
 
     for seg in donnees:
         seg["texte_original"] = aerer_et_structurer_texte(seg.get("texte_original", ""))
@@ -232,7 +260,7 @@ async def synthese_segment_robuste(segment: str, voix_principale: str, voix_seco
                 return True
         except Exception as err:
             delai = essai * 3
-            print(f"     [Retry {essai}/{max_essais}] Erreur TTS ({err}). Attente {delai}s...")
+            print(f"     [Retry TTS {essai}/{max_essais}] Erreur ({err}). Attente {delai}s...")
             await asyncio.sleep(delai)
     return False
 
@@ -318,8 +346,7 @@ async def orchestrer_synthese_async(script_vf, chemin_mp3_final):
 # ---------------------------------------------------------
 def executer_workflow():
     print("🎙️ Agent CastMorph démarré sur GitHub Actions.")
-    service = get_drive_service()
-    fichiers_audio = lister_audios_drive(service, DRIVE_FOLDER_ID)
+    fichiers_audio = lister_audios_drive(DRIVE_FOLDER_ID)
 
     if not fichiers_audio:
         print("Aucun fichier audio trouvé dans le dossier Google Drive partagé.")
@@ -348,9 +375,10 @@ def executer_workflow():
             print(f"🎧 Traitement de : {nom_complet}")
             print(f"==================================================")
 
+            chemin_local_source = os.path.join(dossier_telechargement, f"source_{f['id']}{extension}")
+
             try:
-                chemin_local_source = os.path.join(dossier_telechargement, f"source_{f['id']}{extension}")
-                telecharger_fichier_drive(service, f["id"], chemin_local_source)
+                telecharger_fichier_drive_robuste(f["id"], chemin_local_source)
                 print("  ✓ Fichier téléchargé depuis Google Drive.")
 
                 contexte = f"Nom du fichier : {base_nom}\nDescription : {description_drive}"
@@ -380,6 +408,10 @@ def executer_workflow():
             except Exception as err_fichier:
                 print(f"  ❌ Erreur rencontrée sur « {nom_complet} » : {err_fichier}")
                 print("  ⏭️ Passage au fichier suivant...\n")
+            finally:
+                # Nettoyage immédiat de la source locale pour préserver l'espace disque
+                if os.path.exists(chemin_local_source):
+                    os.remove(chemin_local_source)
 
             time.sleep(3)
 
