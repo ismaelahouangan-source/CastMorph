@@ -30,7 +30,6 @@ MODELE_TTS = "gemini-3.8-flash-lite-tts"
 # ---------------------------------------------------------
 # CASTING VOCAL (VOIX VERROUILLÉES & POOLS ALÉATOIRES)
 # ---------------------------------------------------------
-# Voix fixes pour les hôtes récurrents (clé en minuscules -> nom de voix Gemini)
 VOIX_VERROUILLEES = {
     "hannah fry": "Aoede",
     "professor hannah fry": "Aoede",
@@ -38,24 +37,31 @@ VOIX_VERROUILLEES = {
     "professeur hannah fry": "Aoede",
 }
 
-VOIX_HOMMES = [
-    "Orus",      # Grave, posé
-    "Fenrir",    # Dynamique, expressif
-    "Charon",    # Chaleureux, profond
-    "Puck",      # Vif, conversationnel
-]
+DESCRIPTIONS_VOIX = {
+    "Aoede": "une voix féminine claire, posée, chaleureuse et intelligente d'animatrice scientifique britannique parlant un français fluide",
+    "Fola": "une voix féminine chaleureuse, amicale et posée",
+    "Kore": "une voix féminine dynamique, articulée et vive",
+    "Leda": "une voix féminine douce, fluide et conversationnelle",
+    "Orus": "une voix masculine grave, calme et posée d'expert",
+    "Fenrir": "une voix masculine dynamique et expressive",
+    "Charon": "une voix masculine chaleureuse et profonde",
+    "Puck": "une voix masculine vive et conversationnelle",
+}
 
-VOIX_FEMMES = [
-    "Aoede",     # Claire, naturelle, expressive
-    "Fola",      # Chaleureuse, amicale, médium
-    "Kore",      # Dynamique, articulée
-    "Leda",      # Douce, fluide
-]
+VOIX_HOMMES = ["Orus", "Fenrir", "Charon", "Puck"]
+VOIX_FEMMES = ["Aoede", "Fola", "Kore", "Leda"]
 
 if not GOOGLE_API_KEY or not SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
     raise ValueError("Variables DRIVE_FOLDER_ID, GOOGLE_API_KEY ou GCP_CREDENTIALS_JSON manquantes.")
 
 client_gemini = genai.Client(api_key=GOOGLE_API_KEY)
+client_gemini_alpha = genai.Client(
+    api_key=GOOGLE_API_KEY,
+    http_options=types.HttpOptions(api_version="v1alpha")
+)
+
+# Verrouille automatiquement le protocole validé sur la 1ère réplique
+MODE_TTS_VERROUILLE = None
 
 # ---------------------------------------------------------
 # GESTION DE L'ARRÊT MANUEL (SAUVEGARDE IMMÉDIATE)
@@ -290,7 +296,6 @@ def attribuer_voix_episode(script_vf) -> dict:
 
     voix_deja_prises = set()
 
-    # 1. Verrouillage des hôtes récurrents (ex: Hannah Fry -> Aoede)
     for nom, genre in locuteurs_uniques:
         nom_min = nom.lower().strip()
         for cle_verrou, voix_fixe in VOIX_VERROUILLEES.items():
@@ -299,7 +304,6 @@ def attribuer_voix_episode(script_vf) -> dict:
                 voix_deja_prises.add(voix_fixe)
                 break
 
-    # 2. Attribution aléatoire par genre pour les invités
     dispo_h = [v for v in VOIX_HOMMES if v not in voix_deja_prises]
     dispo_f = [v for v in VOIX_FEMMES if v not in voix_deja_prises]
 
@@ -323,7 +327,7 @@ def attribuer_voix_episode(script_vf) -> dict:
     return map_locuteurs_voix
 
 # ---------------------------------------------------------
-# ÉTAPE 3 : SYNTHÈSE VOCALE GEMINI 3.8 FLASH LITE TTS (FAIL-FAST)
+# ÉTAPE 3 : SYNTHÈSE VOCALE GEMINI 3.8 FLASH LITE TTS
 # ---------------------------------------------------------
 def convertir_flux_gemini_en_mp3(audio_bytes: bytes, mime_type: str, chemin_mp3_sortie: str, dossier_tmp: str, index_clip: int):
     est_wav = audio_bytes[:4] == b"RIFF" or "wav" in mime_type.lower()
@@ -369,6 +373,38 @@ def assembler_fichiers_mp3(fichiers_liste: list, chemin_mp3_destination: str, do
     subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return os.path.exists(chemin_mp3_destination)
 
+def executer_requete_tts(mode: str, segment: str, voix_name: str):
+    """Appelle uniquement gemini-3.8-flash-lite-tts selon le format accepté par l'endpoint."""
+    if mode == "alpha_speech_config":
+        return client_gemini_alpha.models.generate_content(
+            model=MODELE_TTS,
+            contents=segment,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voix_name
+                        )
+                    )
+                )
+            )
+        )
+    else:
+        # Mode Voice Design natif (sans speechConfig dans generation_config)
+        desc_voix = DESCRIPTIONS_VOIX.get(voix_name, "une voix naturelle et posée de podcast")
+        prompt_tts = (
+            f"Lis uniquement le texte français suivant à haute voix avec {desc_voix}, "
+            f"sur un ton naturel de podcast, sans rien ajouter ni commenter :\n\n{segment}"
+        )
+        return client_gemini.models.generate_content(
+            model=MODELE_TTS,
+            contents=prompt_tts,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"]
+            )
+        )
+
 def synthese_segment_gemini_tts(
     segment: str,
     voix_name: str,
@@ -377,56 +413,60 @@ def synthese_segment_gemini_tts(
     index_clip: int,
     max_essais_reseau: int = 3
 ) -> bool:
-    """
-    Appelle gemini-3.8-flash-lite-tts avec SpeechConfig et arrêt immédiat (Fail-Fast)
-    en cas d'erreur de code ou de paramètres API.
-    """
-    for essai in range(1, max_essais_reseau + 1):
-        if ARRET_DEMANDE:
-            return False
-        try:
-            reponse = client_gemini.models.generate_content(
-                model=MODELE_TTS,
-                contents=segment,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voix_name
-                            )
-                        )
-                    )
-                )
-            )
+    global MODE_TTS_VERROUILLE
 
-            audio_bytes = None
-            mime_type = "audio/pcm"
-            if reponse.candidates and reponse.candidates[0].content and reponse.candidates[0].content.parts:
-                for part in reponse.candidates[0].content.parts:
-                    if part.inline_data and part.inline_data.data:
-                        audio_bytes = part.inline_data.data
-                        mime_type = part.inline_data.mime_type or "audio/pcm"
+    modes_a_tester = (
+        [MODE_TTS_VERROUILLE]
+        if MODE_TTS_VERROUILLE
+        else ["alpha_speech_config", "prompt_voice_design"]
+    )
+
+    for mode in modes_a_tester:
+        for essai in range(1, max_essais_reseau + 1):
+            if ARRET_DEMANDE:
+                return False
+            try:
+                reponse = executer_requete_tts(mode, segment, voix_name)
+
+                audio_bytes = None
+                mime_type = "audio/pcm"
+                if reponse.candidates and reponse.candidates[0].content and reponse.candidates[0].content.parts:
+                    for part in reponse.candidates[0].content.parts:
+                        if part.inline_data and part.inline_data.data:
+                            audio_bytes = part.inline_data.data
+                            mime_type = part.inline_data.mime_type or "audio/pcm"
+                            break
+
+                if not audio_bytes:
+                    raise RuntimeError("Réponse vide : aucun flux audio retourné par gemini-3.8-flash-lite-tts.")
+
+                convertir_flux_gemini_en_mp3(audio_bytes, mime_type, chemin_mp3_sortie, dossier_tmp, index_clip)
+
+                if os.path.exists(chemin_mp3_sortie) and os.path.getsize(chemin_mp3_sortie) > 0:
+                    if MODE_TTS_VERROUILLE != mode:
+                        MODE_TTS_VERROUILLE = mode
+                        print(f"     ✓ Protocole TTS validé et verrouillé : {mode}", flush=True)
+                    return True
+
+            except Exception as err:
+                err_str = str(err)
+                # Si speechConfig est rejeté en 400 sur le 1er mode, on passe instantanément au mode prompt_voice_design
+                if "400" in err_str or "INVALID_ARGUMENT" in err_str:
+                    if mode != modes_a_tester[-1]:
+                        print(f"     [Ajustement] '{mode}' non accepté par l'endpoint, passage immédiat au mode suivant...", flush=True)
                         break
+                    raise RuntimeError(f"Erreur fatale API Gemini TTS (arrêt immédiat) : {err_str}") from err
 
-            if not audio_bytes:
-                raise RuntimeError("Réponse vide : aucun flux audio retourné par gemini-3.8-flash-lite-tts.")
+                # Arrêt immédiat sur erreur d'authentification ou modèle introuvable
+                if any(code in err_str for code in ("401", "403", "404", "NOT_FOUND")):
+                    raise RuntimeError(f"Erreur fatale API Gemini TTS (arrêt immédiat) : {err_str}") from err
 
-            convertir_flux_gemini_en_mp3(audio_bytes, mime_type, chemin_mp3_sortie, dossier_tmp, index_clip)
-            return os.path.exists(chemin_mp3_sortie) and os.path.getsize(chemin_mp3_sortie) > 0
+                if essai == max_essais_reseau:
+                    raise RuntimeError(f"Échec après {max_essais_reseau} tentatives réseau : {err_str}") from err
 
-        except Exception as err:
-            err_str = str(err)
-            # Arrêt immédiat sans attente si erreur de code, paramètre, modèle ou authentification
-            if any(code in err_str for code in ("400", "INVALID_ARGUMENT", "401", "403", "404", "NOT_FOUND")):
-                raise RuntimeError(f"Erreur fatale API Gemini TTS (arrêt immédiat) : {err_str}") from err
-
-            if essai == max_essais_reseau:
-                raise RuntimeError(f"Échec après {max_essais_reseau} tentatives réseau : {err_str}") from err
-
-            delai = essai * 3
-            print(f"     [Retry réseau {essai}/{max_essais_reseau}] {err_str[:100]}. Attente {delai}s...", flush=True)
-            time.sleep(delai)
+                delai = essai * 3
+                print(f"     [Retry réseau {essai}/{max_essais_reseau}] {err_str[:100]}. Attente {delai}s...", flush=True)
+                time.sleep(delai)
 
     return False
 
