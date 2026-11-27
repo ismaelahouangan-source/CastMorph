@@ -1,7 +1,9 @@
 import os
 import re
+import sys
 import json
 import time
+import signal
 import random
 import shutil
 import tempfile
@@ -23,31 +25,31 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 EXTENSIONS_AUDIO = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")
 
 MODELE_ANALYSE = "gemini-3.8-flash"
-MODELE_TTS = "gemini-3.8-flash-tts"
+MODELE_TTS = "gemini-3.8-flash-lite-tts"
 
 # ---------------------------------------------------------
-# CASTING VOCAL : VOIX VERROUILLÉES & POOLS ALÉATOIRES
+# CASTING VOCAL (VOIX VERROUILLÉES & POOLS ALÉATOIRES)
 # ---------------------------------------------------------
-# Ajoutez ici en minuscules les hôtes récurrents dont la voix doit rester fixe
+# Voix fixes pour les hôtes récurrents (clé en minuscules -> nom de voix Gemini)
 VOIX_VERROUILLEES = {
-    "hannah fry": "Aoede",          # Hôte du Google DeepMind Podcast
-    "professeur hannah fry": "Aoede",
-    "professeure hannah fry": "Aoede",
+    "hannah fry": "Aoede",
     "professor hannah fry": "Aoede",
+    "professeure hannah fry": "Aoede",
+    "professeur hannah fry": "Aoede",
 }
 
 VOIX_HOMMES = [
     "Orus",      # Grave, posé
     "Fenrir",    # Dynamique, expressif
     "Charon",    # Chaleureux, profond
-    "Puck"       # Vif, conversationnel
+    "Puck",      # Vif, conversationnel
 ]
 
 VOIX_FEMMES = [
     "Aoede",     # Claire, naturelle, expressive
-    "Fola",      # Chaleureuse, posée
+    "Fola",      # Chaleureuse, amicale, médium
     "Kore",      # Dynamique, articulée
-    "Leda"       # Douce, fluide
+    "Leda",      # Douce, fluide
 ]
 
 if not GOOGLE_API_KEY or not SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
@@ -56,10 +58,22 @@ if not GOOGLE_API_KEY or not SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
 client_gemini = genai.Client(api_key=GOOGLE_API_KEY)
 
 # ---------------------------------------------------------
-# FONCTIONS GOOGLE DRIVE (CONNEXION FRAÎCHE & RETRY)
+# GESTION DE L'ARRÊT MANUEL (SAUVEGARDE IMMÉDIATE)
+# ---------------------------------------------------------
+ARRET_DEMANDE = False
+
+def gerer_signal_arret(signum, frame):
+    global ARRET_DEMANDE
+    ARRET_DEMANDE = True
+    print("\n🛑 Arrêt manuel détecté ! Assemblage et sauvegarde des fichiers déjà générés...", flush=True)
+
+signal.signal(signal.SIGINT, gerer_signal_arret)
+signal.signal(signal.SIGTERM, gerer_signal_arret)
+
+# ---------------------------------------------------------
+# FONCTIONS GOOGLE DRIVE
 # ---------------------------------------------------------
 def get_drive_service():
-    """Crée une nouvelle instance Drive avec une connexion SSL fraîche."""
     info_compte = json.loads(SERVICE_ACCOUNT_JSON)
     creds = service_account.Credentials.from_service_account_info(info_compte, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -76,9 +90,10 @@ def lister_audios_drive(folder_id):
     audios = [f for f in fichiers if f["name"].lower().endswith(EXTENSIONS_AUDIO)]
     return sorted(audios, key=lambda x: x["name"])
 
-def telecharger_fichier_drive_robuste(file_id, chemin_destination, max_essais=4):
-    """Télécharge le fichier avec réinitialisation de la connexion SSL en cas de coupure."""
+def telecharger_fichier_drive_robuste(file_id, chemin_destination, max_essais=3):
     for essai in range(1, max_essais + 1):
+        if ARRET_DEMANDE:
+            return
         try:
             service_frais = get_drive_service()
             request = service_frais.files().get_media(fileId=file_id)
@@ -86,14 +101,14 @@ def telecharger_fichier_drive_robuste(file_id, chemin_destination, max_essais=4)
                 downloader = MediaIoBaseDownload(fh, request, chunksize=5 * 1024 * 1024)
                 done = False
                 while not done:
+                    if ARRET_DEMANDE:
+                        return
                     _, done = downloader.next_chunk()
             return
         except Exception as err:
             if essai == max_essais:
                 raise err
-            delai = essai * 4
-            print(f"     [Retry Drive {essai}/{max_essais}] Coupure réseau ({err}). Reconnexion dans {delai}s...")
-            time.sleep(delai)
+            time.sleep(essai * 3)
 
 # ---------------------------------------------------------
 # NETTOYAGE, AÉRATION & DÉCOUPAGE
@@ -144,18 +159,19 @@ def decouper_texte_en_phrases(texte: str, max_chars: int = 1800) -> list:
 # ÉTAPE 1 : TRANSCRIPTION & DIARISATION (VO)
 # ---------------------------------------------------------
 def attendre_fichier_actif(audio_file):
-    while True:
+    while not ARRET_DEMANDE:
         info_fichier = client_gemini.files.get(name=audio_file.name)
         etat = getattr(info_fichier.state, "name", str(info_fichier.state))
         if "ACTIVE" in etat:
             return info_fichier
         if "FAILED" in etat:
             raise RuntimeError(f"Échec du traitement interne du fichier audio par Google : {etat}")
-        print(f"     [Attente indexation Google : {etat}] Nouvelle vérification dans 3s...")
+        print(f"     [Attente indexation Google : {etat}] Vérification dans 3s...", flush=True)
         time.sleep(3)
+    return audio_file
 
 def transcrire_et_diariser(chemin_audio: str, contexte: str):
-    print("  -> Téléversement de la piste audio vers Gemini...")
+    print("  -> Téléversement de la piste audio vers Gemini...", flush=True)
     audio_file = None
     for essai in range(1, 4):
         try:
@@ -164,11 +180,11 @@ def transcrire_et_diariser(chemin_audio: str, contexte: str):
         except Exception as err:
             if essai == 3:
                 raise err
-            print(f"     [Retry Upload Gemini {essai}/3] {err}. Nouvel essai dans 5s...")
-            time.sleep(5)
+            time.sleep(4)
 
     audio_file = attendre_fichier_actif(audio_file)
-    time.sleep(2)
+    if ARRET_DEMANDE:
+        return []
 
     prompt = f"""
     Tu es un ingénieur du son et transcripteur professionnel.
@@ -177,7 +193,7 @@ def transcrire_et_diariser(chemin_audio: str, contexte: str):
 
     CONSIGNES CRITIQUES :
     1. Transcris fidèlement l'intégralité de l'audio en découpant par tour de parole (diarisation).
-    2. Identifie précisément chaque intervenant en t'aidant du contexte et de l'introduction orale (ex: "Hannah Fry", "Mark Cole", "Voix off", ou le nom complet de l'invité). Pour Hannah Fry, écris toujours exactement "Hannah Fry".
+    2. Identifie précisément chaque intervenant en t'aidant du contexte et de l'introduction orale (ex: "Hannah Fry", "Voix off", ou le nom complet de l'invité). Pour Hannah Fry, écris toujours exactement "Hannah Fry".
     3. Détermine le genre de chaque locuteur : strictement "masculin" ou "feminin".
     4. STRUCTURE ET AÉRATION : Si une prise de parole est longue, aère-la impérativement en plusieurs paragraphes distincts séparés par un double saut de ligne (\\n\\n). N'aplatis JAMAIS une longue intervention en un bloc compact continu.
     5. N'utilise AUCUN balisage Markdown (pas d'astérisques *, pas de dièses #).
@@ -193,7 +209,7 @@ def transcrire_et_diariser(chemin_audio: str, contexte: str):
     ]
     """
 
-    print(f"  -> Transcription et diarisation en cours ({MODELE_ANALYSE})...")
+    print(f"  -> Transcription et diarisation en cours ({MODELE_ANALYSE})...", flush=True)
     try:
         reponse = client_gemini.models.generate_content(
             model=MODELE_ANALYSE,
@@ -219,7 +235,7 @@ def transcrire_et_diariser(chemin_audio: str, contexte: str):
 # ÉTAPE 2 : TRADUCTION STRUCTURÉE & AÉRÉE (VF)
 # ---------------------------------------------------------
 def traduire_dialogue(script_vo):
-    print("  -> Traduction et adaptation stylistique en français...")
+    print("  -> Traduction et adaptation stylistique en français...", flush=True)
     prompt = f"""
     Tu es un adaptateur et traducteur littéraire pour le doublage audiovisuel.
     Traduis chaque réplique du dialogue suivant de l'anglais vers un français parlé fluide, naturel et élégant.
@@ -260,59 +276,54 @@ def traduire_dialogue(script_vo):
     return donnees
 
 # ---------------------------------------------------------
-# ATTRIBUTION DES VOIX (VERROUILLAGE HÔTE + ALÉATOIRE INVITÉS)
+# CASTING VOCAL (HÔTES VERROUILLÉS + INVITÉS ALÉATOIRES)
 # ---------------------------------------------------------
 def attribuer_voix_episode(script_vf) -> dict:
-    """
-    Verrouille la voix des hôtes définis dans VOIX_VERROUILLEES,
-    puis attribue aléatoirement une voix distincte par genre aux invités.
-    """
     map_locuteurs_voix = {}
-
-    # 1. Identifier tous les locuteurs uniques de l'épisode
     locuteurs_uniques = []
+
     for seg in script_vf:
         nom = seg["nom_locuteur"].strip()
         genre = seg.get("genre", "masculin").lower()
         if nom not in [x[0] for x in locuteurs_uniques]:
             locuteurs_uniques.append((nom, genre))
 
-    # 2. Verrouiller en priorité les voix des hôtes connus
     voix_deja_prises = set()
+
+    # 1. Verrouillage des hôtes récurrents (ex: Hannah Fry -> Aoede)
     for nom, genre in locuteurs_uniques:
-        nom_normalise = nom.lower().strip()
+        nom_min = nom.lower().strip()
         for cle_verrou, voix_fixe in VOIX_VERROUILLEES.items():
-            if cle_verrou in nom_normalise:
+            if cle_verrou in nom_min:
                 map_locuteurs_voix[nom] = voix_fixe
                 voix_deja_prises.add(voix_fixe)
                 break
 
-    # 3. Préparer les réservoirs disponibles pour les invités (sans les voix verrouillées)
-    dispo_hommes = [v for v in VOIX_HOMMES if v not in voix_deja_prises]
-    dispo_femmes = [v for v in VOIX_FEMMES if v not in voix_deja_prises]
+    # 2. Attribution aléatoire par genre pour les invités
+    dispo_h = [v for v in VOIX_HOMMES if v not in voix_deja_prises]
+    dispo_f = [v for v in VOIX_FEMMES if v not in voix_deja_prises]
 
-    # 4. Attribuer aléatoirement une voix aux invités selon leur sexe
     for nom, genre in locuteurs_uniques:
         if nom in map_locuteurs_voix:
             continue
 
         if "fem" in genre:
-            if not dispo_femmes:
-                dispo_femmes = [v for v in VOIX_FEMMES if v not in voix_deja_prises] or list(VOIX_FEMMES)
-            voix_choisie = random.choice(dispo_femmes)
-            dispo_femmes.remove(voix_choisie)
+            if not dispo_f:
+                dispo_f = [v for v in VOIX_FEMMES if v not in voix_deja_prises] or list(VOIX_FEMMES)
+            voix_choisie = random.choice(dispo_f)
+            dispo_f.remove(voix_choisie)
         else:
-            if not dispo_hommes:
-                dispo_hommes = [v for v in VOIX_HOMMES if v not in voix_deja_prises] or list(VOIX_HOMMES)
-            voix_choisie = random.choice(dispo_hommes)
-            dispo_hommes.remove(voix_choisie)
+            if not dispo_h:
+                dispo_h = [v for v in VOIX_HOMMES if v not in voix_deja_prises] or list(VOIX_HOMMES)
+            voix_choisie = random.choice(dispo_h)
+            dispo_h.remove(voix_choisie)
 
         map_locuteurs_voix[nom] = voix_choisie
 
     return map_locuteurs_voix
 
 # ---------------------------------------------------------
-# ÉTAPE 3 : SYNTHÈSE VOCALE GEMINI 3.8 FLASH TTS
+# ÉTAPE 3 : SYNTHÈSE VOCALE GEMINI 3.8 FLASH LITE TTS (FAIL-FAST)
 # ---------------------------------------------------------
 def convertir_flux_gemini_en_mp3(audio_bytes: bytes, mime_type: str, chemin_mp3_sortie: str, dossier_tmp: str, index_clip: int):
     est_wav = audio_bytes[:4] == b"RIFF" or "wav" in mime_type.lower()
@@ -340,17 +351,39 @@ def convertir_flux_gemini_en_mp3(audio_bytes: bytes, mime_type: str, chemin_mp3_
     if os.path.exists(chemin_brut):
         os.remove(chemin_brut)
 
+def assembler_fichiers_mp3(fichiers_liste: list, chemin_mp3_destination: str, dossier_tmp: str) -> bool:
+    clips_valides = [f for f in fichiers_liste if os.path.exists(f) and os.path.getsize(f) > 0]
+    if not clips_valides:
+        return False
+
+    concat_txt = os.path.join(dossier_tmp, "concat_list.txt")
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        for item in clips_valides:
+            f.write(f"file '{item}'\n")
+
+    cmd_concat = [
+        "ffmpeg", "-y", "-f", "concat",
+        "-safe", "0", "-i", concat_txt,
+        "-c", "copy", chemin_mp3_destination
+    ]
+    subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return os.path.exists(chemin_mp3_destination)
+
 def synthese_segment_gemini_tts(
     segment: str,
-    voix_principale: str,
-    voix_secours: str,
+    voix_name: str,
     chemin_mp3_sortie: str,
     dossier_tmp: str,
     index_clip: int,
-    max_essais: int = 5
+    max_essais_reseau: int = 3
 ) -> bool:
-    for essai in range(1, max_essais + 1):
-        voix_active = voix_principale if essai <= 3 else voix_secours
+    """
+    Appelle gemini-3.8-flash-lite-tts avec SpeechConfig et arrêt immédiat (Fail-Fast)
+    en cas d'erreur de code ou de paramètres API.
+    """
+    for essai in range(1, max_essais_reseau + 1):
+        if ARRET_DEMANDE:
+            return False
         try:
             reponse = client_gemini.models.generate_content(
                 model=MODELE_TTS,
@@ -360,7 +393,7 @@ def synthese_segment_gemini_tts(
                     speech_config=types.SpeechConfig(
                         voice_config=types.VoiceConfig(
                             prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voix_active
+                                voice_name=voix_name
                             )
                         )
                     )
@@ -377,26 +410,33 @@ def synthese_segment_gemini_tts(
                         break
 
             if not audio_bytes:
-                raise RuntimeError("Aucun flux audio retourné par le modèle TTS.")
+                raise RuntimeError("Réponse vide : aucun flux audio retourné par gemini-3.8-flash-lite-tts.")
 
             convertir_flux_gemini_en_mp3(audio_bytes, mime_type, chemin_mp3_sortie, dossier_tmp, index_clip)
-
-            if os.path.exists(chemin_mp3_sortie) and os.path.getsize(chemin_mp3_sortie) > 0:
-                return True
+            return os.path.exists(chemin_mp3_sortie) and os.path.getsize(chemin_mp3_sortie) > 0
 
         except Exception as err:
             err_str = str(err)
-            delai = 15 if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) else essai * 4
-            print(f"     [Retry Gemini TTS {essai}/{max_essais} - Voix {voix_active}] Erreur ({err_str[:140]}). Attente {delai}s...")
+            # Arrêt immédiat sans attente si erreur de code, paramètre, modèle ou authentification
+            if any(code in err_str for code in ("400", "INVALID_ARGUMENT", "401", "403", "404", "NOT_FOUND")):
+                raise RuntimeError(f"Erreur fatale API Gemini TTS (arrêt immédiat) : {err_str}") from err
+
+            if essai == max_essais_reseau:
+                raise RuntimeError(f"Échec après {max_essais_reseau} tentatives réseau : {err_str}") from err
+
+            delai = essai * 3
+            print(f"     [Retry réseau {essai}/{max_essais_reseau}] {err_str[:100]}. Attente {delai}s...", flush=True)
             time.sleep(delai)
 
     return False
 
-def orchestrer_synthese_gemini_tts(script_vf, chemin_mp3_final):
+def orchestrer_synthese_gemini_tts(script_vf, chemin_mp3_final, base_nom):
     map_locuteurs_voix = attribuer_voix_episode(script_vf)
-    print(f"  -> Casting vocal attribué (Hôtes verrouillés + Invités aléatoires) : {map_locuteurs_voix}")
+    print(f"  -> Casting vocal attribué : {map_locuteurs_voix}", flush=True)
 
     dossier_tmp = tempfile.mkdtemp()
+    fichiers_liste = []
+
     try:
         chemin_silence = os.path.join(dossier_tmp, "silence.mp3")
         cmd_silence = [
@@ -407,32 +447,33 @@ def orchestrer_synthese_gemini_tts(script_vf, chemin_mp3_final):
         ]
         subprocess.run(cmd_silence, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        fichiers_liste = []
         compteur_morceau = 0
         total_repliques = len(script_vf)
 
         for i, seg in enumerate(script_vf, start=1):
+            if ARRET_DEMANDE:
+                break
+
             texte_brut = seg["texte_fr"].strip()
             if not texte_brut:
                 continue
 
             locuteur = seg["nom_locuteur"].strip()
-            genre = seg.get("genre", "masculin").lower()
             voix_voulue = map_locuteurs_voix[locuteur]
-            voix_secours = "Orus" if "fem" not in genre else "Aoede"
 
-            print(f"  -> Synthèse réplique {i}/{total_repliques} ({locuteur} - Voix {voix_voulue})...")
+            print(f"  -> Synthèse réplique {i}/{total_repliques} ({locuteur} - Voix {voix_voulue})...", flush=True)
             texte_purifie = nettoyer_texte_pour_audio(texte_brut)
             sous_morceaux = decouper_texte_en_phrases(texte_purifie, max_chars=1800)
 
             for sous_bloc in sous_morceaux:
+                if ARRET_DEMANDE:
+                    break
                 if not sous_bloc.strip():
                     continue
                 clip_path = os.path.join(dossier_tmp, f"part_{compteur_morceau:05d}.mp3")
                 succes = synthese_segment_gemini_tts(
                     segment=sous_bloc,
-                    voix_principale=voix_voulue,
-                    voix_secours=voix_secours,
+                    voix_name=voix_voulue,
                     chemin_mp3_sortie=clip_path,
                     dossier_tmp=dossier_tmp,
                     index_clip=compteur_morceau
@@ -440,48 +481,42 @@ def orchestrer_synthese_gemini_tts(script_vf, chemin_mp3_final):
                 if succes:
                     fichiers_liste.append(clip_path)
                     compteur_morceau += 1
-                else:
-                    print(f"     ⚠️ Échec définitif sur un sous-bloc de {locuteur}.")
 
-                time.sleep(1.5)
+            if not ARRET_DEMANDE:
+                fichiers_liste.append(chemin_silence)
 
-            fichiers_liste.append(chemin_silence)
+        if ARRET_DEMANDE:
+            chemin_partiel = os.path.join("output", f"Podcast_VF_{base_nom}_PARTIEL.mp3")
+            if assembler_fichiers_mp3(fichiers_liste, chemin_partiel, dossier_tmp):
+                print(f"  💾 Audio partiel sauvegardé : Podcast_VF_{base_nom}_PARTIEL.mp3", flush=True)
+            return
 
-        if not fichiers_liste:
-            raise RuntimeError("Aucun segment audio n'a pu être généré pour cet épisode.")
-
-        concat_txt = os.path.join(dossier_tmp, "concat_list.txt")
-        with open(concat_txt, "w", encoding="utf-8") as f:
-            for item in fichiers_liste:
-                f.write(f"file '{item}'\n")
-
-        cmd_concat = [
-            "ffmpeg", "-y", "-f", "concat",
-            "-safe", "0", "-i", concat_txt,
-            "-c", "copy", chemin_mp3_final
-        ]
-        subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        if not assembler_fichiers_mp3(fichiers_liste, chemin_mp3_final, dossier_tmp):
+            raise RuntimeError("Aucun segment audio n'a pu être assemblé.")
 
     finally:
         shutil.rmtree(dossier_tmp, ignore_errors=True)
 
 # ---------------------------------------------------------
-# ORCHESTRATION GLOBALE RÉSILIENTE
+# ORCHESTRATION GLOBALE
 # ---------------------------------------------------------
 def executer_workflow():
-    print(f"🎙️ Agent CastMorph démarré sur GitHub Actions (Moteur TTS : {MODELE_TTS}).")
+    print(f"🎙️ Agent CastMorph démarré sur GitHub Actions (Moteur : {MODELE_TTS}).", flush=True)
     fichiers_audio = lister_audios_drive(DRIVE_FOLDER_ID)
 
     if not fichiers_audio:
-        print("Aucun fichier audio trouvé dans le dossier Google Drive partagé.")
+        print("Aucun fichier audio trouvé dans le dossier Google Drive partagé.", flush=True)
         return
 
-    print(f"📂 {len(fichiers_audio)} fichier(s) audio détecté(s) dans Drive.\n")
+    print(f"📂 {len(fichiers_audio)} fichier(s) audio détecté(s) dans Drive.\n", flush=True)
     os.makedirs("output", exist_ok=True)
     dossier_telechargement = tempfile.mkdtemp()
 
     try:
         for f in fichiers_audio:
+            if ARRET_DEMANDE:
+                break
+
             nom_complet = f["name"]
             base_nom = nom_complet.rsplit(".", 1)[0]
             extension = os.path.splitext(nom_complet)[1]
@@ -492,21 +527,26 @@ def executer_workflow():
             chemin_mp3 = os.path.join("output", f"Podcast_VF_{base_nom}.mp3")
 
             if os.path.exists(chemin_vo) and os.path.exists(chemin_vf) and os.path.exists(chemin_mp3):
-                print(f"⏭️ Déjà traité : {nom_complet}")
+                print(f"⏭️ Déjà traité : {nom_complet}", flush=True)
                 continue
 
-            print("==================================================")
-            print(f"🎧 Traitement de : {nom_complet}")
-            print("==================================================")
+            print("==================================================", flush=True)
+            print(f"🎧 Traitement de : {nom_complet}", flush=True)
+            print("==================================================", flush=True)
 
             chemin_local_source = os.path.join(dossier_telechargement, f"source_{f['id']}{extension}")
 
             try:
                 telecharger_fichier_drive_robuste(f["id"], chemin_local_source)
-                print("  ✓ Fichier téléchargé depuis Google Drive.")
+                if ARRET_DEMANDE:
+                    break
+                print("  ✓ Fichier téléchargé depuis Google Drive.", flush=True)
 
+                # Phase 1 : Transcription VO
                 contexte = f"Nom du fichier : {base_nom}\nDescription : {description_drive}"
                 script_vo = transcrire_et_diariser(chemin_local_source, contexte)
+                if ARRET_DEMANDE or not script_vo:
+                    break
 
                 texte_export_vo = ""
                 for rep in script_vo:
@@ -514,9 +554,13 @@ def executer_workflow():
 
                 with open(chemin_vo, "w", encoding="utf-8") as f_vo:
                     f_vo.write(texte_export_vo.strip())
-                print(f"  ✓ Transcription VO sauvegardée : Transcription_VO_{base_nom}.txt")
+                    f_vo.flush()
+                print(f"  ✓ Phase 1 sauvegardée : Transcription_VO_{base_nom}.txt", flush=True)
 
+                # Phase 2 : Traduction VF
                 script_vf = traduire_dialogue(script_vo)
+                if ARRET_DEMANDE or not script_vf:
+                    break
 
                 texte_export_vf = ""
                 for rep in script_vf:
@@ -524,23 +568,27 @@ def executer_workflow():
 
                 with open(chemin_vf, "w", encoding="utf-8") as f_vf:
                     f_vf.write(texte_export_vf.strip())
-                print(f"  ✓ Traduction VF sauvegardée : Traduction_VF_{base_nom}.txt")
+                    f_vf.flush()
+                print(f"  ✓ Phase 2 sauvegardée : Traduction_VF_{base_nom}.txt", flush=True)
 
-                orchestrer_synthese_gemini_tts(script_vf, chemin_mp3)
-                print(f"  ✓ Podcast doublé généré : Podcast_VF_{base_nom}.mp3\n")
+                # Phase 3 : Synthèse Vocale Gemini 3.8 Flash Lite TTS
+                orchestrer_synthese_gemini_tts(script_vf, chemin_mp3, base_nom)
+                if not ARRET_DEMANDE and os.path.exists(chemin_mp3):
+                    print(f"  ✓ Phase 3 sauvegardée : Podcast_VF_{base_nom}.mp3\n", flush=True)
 
+            except RuntimeError as err_fatale:
+                print(f"  ❌ {err_fatale}", flush=True)
+                sys.exit(1)
             except Exception as err_fichier:
-                print(f"  ❌ Erreur rencontrée sur « {nom_complet} » : {err_fichier}")
-                print("  ⏭️ Passage au fichier suivant...\n")
+                print(f"  ❌ Erreur rencontrée sur « {nom_complet} » : {err_fichier}", flush=True)
+                print("  ⏭️ Passage au fichier suivant...\n", flush=True)
             finally:
                 if os.path.exists(chemin_local_source):
                     os.remove(chemin_local_source)
 
-            time.sleep(3)
-
     finally:
         shutil.rmtree(dossier_telechargement, ignore_errors=True)
-        print("🏁 Traitement de la file terminé.")
+        print("🏁 Fin d'exécution. Empaquetage des résultats dans output/.", flush=True)
 
 if __name__ == "__main__":
     executer_workflow()
