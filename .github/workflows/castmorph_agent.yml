@@ -10,10 +10,13 @@ jobs:
       - name: Récupérer le dépôt
         uses: actions/checkout@v4
 
-      - name: Installer FFmpeg (Assemblage Audio)
+      - name: Vérifier ou installer FFmpeg (Assemblage Audio)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          if ! command -v ffmpeg &> /dev/null; then
+            for i in 1 2 3; do
+              sudo apt-get update && sudo apt-get install -y --fix-missing ffmpeg && break || sleep 5
+            done
+          fi
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -38,3 +41,4 @@ jobs:
         with:
           name: CastMorph-Podcasts-Resultats
           path: output/
+          if-no-files-found: warn
