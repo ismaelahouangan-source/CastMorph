@@ -2,11 +2,10 @@ import os
 import re
 import json
 import time
+import random
 import shutil
-import asyncio
 import tempfile
 import subprocess
-import edge_tts
 from google import genai
 from google.genai import types
 from google.oauth2 import service_account
@@ -23,18 +22,32 @@ SERVICE_ACCOUNT_JSON = os.environ.get("GCP_CREDENTIALS_JSON", "").strip()
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 EXTENSIONS_AUDIO = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")
 
+MODELE_ANALYSE = "gemini-3.8-flash"
+MODELE_TTS = "gemini-3.8-flash-tts"
+
+# ---------------------------------------------------------
+# CASTING VOCAL : VOIX VERROUILLÉES & POOLS ALÉATOIRES
+# ---------------------------------------------------------
+# Ajoutez ici en minuscules les hôtes récurrents dont la voix doit rester fixe
+VOIX_VERROUILLEES = {
+    "hannah fry": "Aoede",          # Hôte du Google DeepMind Podcast
+    "professeur hannah fry": "Aoede",
+    "professeure hannah fry": "Aoede",
+    "professor hannah fry": "Aoede",
+}
+
 VOIX_HOMMES = [
-    "fr-FR-HenriNeural",                 # Homme 1 (Grave, narratif)
-    "fr-FR-RemyMultilingualNeural",      # Homme 2 (Médium, naturel)
-    "fr-CA-AntoineNeural",               # Homme 3 (Dynamique)
-    "fr-BE-GerardNeural"                 # Homme 4 (Posé)
+    "Orus",      # Grave, posé
+    "Fenrir",    # Dynamique, expressif
+    "Charon",    # Chaleureux, profond
+    "Puck"       # Vif, conversationnel
 ]
 
 VOIX_FEMMES = [
-    "fr-FR-DeniseNeural",                # Femme 1 (Douce, claire)
-    "fr-FR-EloiseNeural",                # Femme 2 (Dynamique, vive)
-    "fr-FR-VivienneMultilingualNeural",  # Femme 3 (Conversationnelle)
-    "fr-BE-CharlineNeural"               # Femme 4 (Chaleureuse)
+    "Aoede",     # Claire, naturelle, expressive
+    "Fola",      # Chaleureuse, posée
+    "Kore",      # Dynamique, articulée
+    "Leda"       # Douce, fluide
 ]
 
 if not GOOGLE_API_KEY or not SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
@@ -64,10 +77,9 @@ def lister_audios_drive(folder_id):
     return sorted(audios, key=lambda x: x["name"])
 
 def telecharger_fichier_drive_robuste(file_id, chemin_destination, max_essais=4):
-    """Télécharge le fichier avec réinitialisation de la connexion SSL en cas de Broken Pipe."""
+    """Télécharge le fichier avec réinitialisation de la connexion SSL en cas de coupure."""
     for essai in range(1, max_essais + 1):
         try:
-            # On recrée le client Drive à chaque tentative pour éviter les sockets expirés
             service_frais = get_drive_service()
             request = service_frais.files().get_media(fileId=file_id)
             with open(chemin_destination, "wb") as fh:
@@ -106,7 +118,7 @@ def nettoyer_texte_pour_audio(texte: str) -> str:
     texte = re.sub(r'[ \t]+', ' ', texte)
     return texte.strip()
 
-def decouper_texte_en_phrases(texte: str, max_chars: int = 1400) -> list:
+def decouper_texte_en_phrases(texte: str, max_chars: int = 1800) -> list:
     paragraphes = [p.strip() for p in texte.split("\n\n") if p.strip()]
     morceaux_finaux = []
 
@@ -129,7 +141,7 @@ def decouper_texte_en_phrases(texte: str, max_chars: int = 1400) -> list:
     return morceaux_finaux
 
 # ---------------------------------------------------------
-# ÉTAPE 1 : TRANSCRIPTION & DIARISATION (AVEC ATTENTE ACTIVE)
+# ÉTAPE 1 : TRANSCRIPTION & DIARISATION (VO)
 # ---------------------------------------------------------
 def attendre_fichier_actif(audio_file):
     while True:
@@ -165,7 +177,7 @@ def transcrire_et_diariser(chemin_audio: str, contexte: str):
 
     CONSIGNES CRITIQUES :
     1. Transcris fidèlement l'intégralité de l'audio en découpant par tour de parole (diarisation).
-    2. Identifie qui parle en t'aidant du contexte (ex: "Donald Miller", "Voix off", "Invité", "Animateur").
+    2. Identifie précisément chaque intervenant en t'aidant du contexte et de l'introduction orale (ex: "Hannah Fry", "Mark Cole", "Voix off", ou le nom complet de l'invité). Pour Hannah Fry, écris toujours exactement "Hannah Fry".
     3. Détermine le genre de chaque locuteur : strictement "masculin" ou "feminin".
     4. STRUCTURE ET AÉRATION : Si une prise de parole est longue, aère-la impérativement en plusieurs paragraphes distincts séparés par un double saut de ligne (\\n\\n). N'aplatis JAMAIS une longue intervention en un bloc compact continu.
     5. N'utilise AUCUN balisage Markdown (pas d'astérisques *, pas de dièses #).
@@ -174,17 +186,17 @@ def transcrire_et_diariser(chemin_audio: str, contexte: str):
     [
       {{
         "speaker_id": "Speaker 1",
-        "nom_locuteur": "Nom de la personne",
-        "genre": "masculin",
+        "nom_locuteur": "Hannah Fry",
+        "genre": "feminin",
         "texte_original": "Paroles prononcées en anglais aérées avec des \\n\\n..."
       }}
     ]
     """
 
-    print("  -> Transcription et diarisation en cours (Gemini 3.8 Flash)...")
+    print(f"  -> Transcription et diarisation en cours ({MODELE_ANALYSE})...")
     try:
         reponse = client_gemini.models.generate_content(
-            model="gemini-3.8-flash",
+            model=MODELE_ANALYSE,
             contents=[audio_file, prompt],
             config=types.GenerateContentConfig(
                 temperature=0.2,
@@ -225,8 +237,8 @@ def traduire_dialogue(script_vo):
     [
       {{
         "speaker_id": "Speaker 1",
-        "nom_locuteur": "Nom de la personne",
-        "genre": "masculin",
+        "nom_locuteur": "Hannah Fry",
+        "genre": "feminin",
         "texte_original": "...",
         "texte_fr": "Premier paragraphe traduit.\\n\\nDeuxième paragraphe bien aéré..."
       }}
@@ -234,7 +246,7 @@ def traduire_dialogue(script_vo):
     """
 
     reponse = client_gemini.models.generate_content(
-        model="gemini-3.8-flash",
+        model=MODELE_ANALYSE,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.25,
@@ -248,40 +260,141 @@ def traduire_dialogue(script_vo):
     return donnees
 
 # ---------------------------------------------------------
-# ÉTAPE 3 : SYNTHÈSE VOCALE ROBUSTE MULTI-VOIX
+# ATTRIBUTION DES VOIX (VERROUILLAGE HÔTE + ALÉATOIRE INVITÉS)
 # ---------------------------------------------------------
-async def synthese_segment_robuste(segment: str, voix_principale: str, voix_secours: str, chemin_fichier: str, max_essais: int = 5):
+def attribuer_voix_episode(script_vf) -> dict:
+    """
+    Verrouille la voix des hôtes définis dans VOIX_VERROUILLEES,
+    puis attribue aléatoirement une voix distincte par genre aux invités.
+    """
+    map_locuteurs_voix = {}
+
+    # 1. Identifier tous les locuteurs uniques de l'épisode
+    locuteurs_uniques = []
+    for seg in script_vf:
+        nom = seg["nom_locuteur"].strip()
+        genre = seg.get("genre", "masculin").lower()
+        if nom not in [x[0] for x in locuteurs_uniques]:
+            locuteurs_uniques.append((nom, genre))
+
+    # 2. Verrouiller en priorité les voix des hôtes connus
+    voix_deja_prises = set()
+    for nom, genre in locuteurs_uniques:
+        nom_normalise = nom.lower().strip()
+        for cle_verrou, voix_fixe in VOIX_VERROUILLEES.items():
+            if cle_verrou in nom_normalise:
+                map_locuteurs_voix[nom] = voix_fixe
+                voix_deja_prises.add(voix_fixe)
+                break
+
+    # 3. Préparer les réservoirs disponibles pour les invités (sans les voix verrouillées)
+    dispo_hommes = [v for v in VOIX_HOMMES if v not in voix_deja_prises]
+    dispo_femmes = [v for v in VOIX_FEMMES if v not in voix_deja_prises]
+
+    # 4. Attribuer aléatoirement une voix aux invités selon leur sexe
+    for nom, genre in locuteurs_uniques:
+        if nom in map_locuteurs_voix:
+            continue
+
+        if "fem" in genre:
+            if not dispo_femmes:
+                dispo_femmes = [v for v in VOIX_FEMMES if v not in voix_deja_prises] or list(VOIX_FEMMES)
+            voix_choisie = random.choice(dispo_femmes)
+            dispo_femmes.remove(voix_choisie)
+        else:
+            if not dispo_hommes:
+                dispo_hommes = [v for v in VOIX_HOMMES if v not in voix_deja_prises] or list(VOIX_HOMMES)
+            voix_choisie = random.choice(dispo_hommes)
+            dispo_hommes.remove(voix_choisie)
+
+        map_locuteurs_voix[nom] = voix_choisie
+
+    return map_locuteurs_voix
+
+# ---------------------------------------------------------
+# ÉTAPE 3 : SYNTHÈSE VOCALE GEMINI 3.8 FLASH TTS
+# ---------------------------------------------------------
+def convertir_flux_gemini_en_mp3(audio_bytes: bytes, mime_type: str, chemin_mp3_sortie: str, dossier_tmp: str, index_clip: int):
+    est_wav = audio_bytes[:4] == b"RIFF" or "wav" in mime_type.lower()
+    ext_brute = ".wav" if est_wav else ".pcm"
+    chemin_brut = os.path.join(dossier_tmp, f"raw_{index_clip:05d}{ext_brute}")
+
+    with open(chemin_brut, "wb") as f:
+        f.write(audio_bytes)
+
+    if est_wav:
+        cmd = [
+            "ffmpeg", "-y", "-i", chemin_brut,
+            "-ar", "24000", "-ac", "1", "-b:a", "128k",
+            chemin_mp3_sortie
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
+            "-i", chemin_brut,
+            "-b:a", "128k",
+            chemin_mp3_sortie
+        ]
+
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    if os.path.exists(chemin_brut):
+        os.remove(chemin_brut)
+
+def synthese_segment_gemini_tts(
+    segment: str,
+    voix_principale: str,
+    voix_secours: str,
+    chemin_mp3_sortie: str,
+    dossier_tmp: str,
+    index_clip: int,
+    max_essais: int = 5
+) -> bool:
     for essai in range(1, max_essais + 1):
         voix_active = voix_principale if essai <= 3 else voix_secours
         try:
-            comm = edge_tts.Communicate(text=segment, voice=voix_active, rate="+0%", volume="+0%")
-            await comm.save(chemin_fichier)
-            if os.path.exists(chemin_fichier) and os.path.getsize(chemin_fichier) > 0:
+            reponse = client_gemini.models.generate_content(
+                model=MODELE_TTS,
+                contents=segment,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=voix_active
+                            )
+                        )
+                    )
+                )
+            )
+
+            audio_bytes = None
+            mime_type = "audio/pcm"
+            if reponse.candidates and reponse.candidates[0].content and reponse.candidates[0].content.parts:
+                for part in reponse.candidates[0].content.parts:
+                    if part.inline_data and part.inline_data.data:
+                        audio_bytes = part.inline_data.data
+                        mime_type = part.inline_data.mime_type or "audio/pcm"
+                        break
+
+            if not audio_bytes:
+                raise RuntimeError("Aucun flux audio retourné par le modèle TTS.")
+
+            convertir_flux_gemini_en_mp3(audio_bytes, mime_type, chemin_mp3_sortie, dossier_tmp, index_clip)
+
+            if os.path.exists(chemin_mp3_sortie) and os.path.getsize(chemin_mp3_sortie) > 0:
                 return True
+
         except Exception as err:
-            delai = essai * 3
-            print(f"     [Retry TTS {essai}/{max_essais}] Erreur ({err}). Attente {delai}s...")
-            await asyncio.sleep(delai)
+            err_str = str(err)
+            delai = 15 if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) else essai * 4
+            print(f"     [Retry Gemini TTS {essai}/{max_essais} - Voix {voix_active}] Erreur ({err_str[:140]}). Attente {delai}s...")
+            time.sleep(delai)
+
     return False
 
-async def orchestrer_synthese_async(script_vf, chemin_mp3_final):
-    map_locuteurs_voix = {}
-    index_h = 0
-    index_f = 0
-
-    for seg in script_vf:
-        locuteur = seg["nom_locuteur"]
-        genre = seg.get("genre", "masculin").lower()
-
-        if locuteur not in map_locuteurs_voix:
-            if genre == "feminin":
-                map_locuteurs_voix[locuteur] = VOIX_FEMMES[index_f % len(VOIX_FEMMES)]
-                index_f += 1
-            else:
-                map_locuteurs_voix[locuteur] = VOIX_HOMMES[index_h % len(VOIX_HOMMES)]
-                index_h += 1
-
-    print(f"  -> Casting vocal attribué : {map_locuteurs_voix}")
+def orchestrer_synthese_gemini_tts(script_vf, chemin_mp3_final):
+    map_locuteurs_voix = attribuer_voix_episode(script_vf)
+    print(f"  -> Casting vocal attribué (Hôtes verrouillés + Invités aléatoires) : {map_locuteurs_voix}")
 
     dossier_tmp = tempfile.mkdtemp()
     try:
@@ -289,10 +402,10 @@ async def orchestrer_synthese_async(script_vf, chemin_mp3_final):
         cmd_silence = [
             "ffmpeg", "-y", "-f", "lavfi",
             "-i", "anullsrc=r=24000:cl=mono",
-            "-t", "0.35", "-q:a", "9",
+            "-t", "0.35", "-b:a", "128k",
             chemin_silence
         ]
-        subprocess.run(cmd_silence, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd_silence, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
         fichiers_liste = []
         compteur_morceau = 0
@@ -303,28 +416,39 @@ async def orchestrer_synthese_async(script_vf, chemin_mp3_final):
             if not texte_brut:
                 continue
 
-            locuteur = seg["nom_locuteur"]
+            locuteur = seg["nom_locuteur"].strip()
             genre = seg.get("genre", "masculin").lower()
             voix_voulue = map_locuteurs_voix[locuteur]
-            voix_secours = "fr-FR-HenriNeural" if genre != "feminin" else "fr-FR-DeniseNeural"
+            voix_secours = "Orus" if "fem" not in genre else "Aoede"
 
-            print(f"  -> Synthèse réplique {i}/{total_repliques} ({locuteur} - {voix_voulue})...")
+            print(f"  -> Synthèse réplique {i}/{total_repliques} ({locuteur} - Voix {voix_voulue})...")
             texte_purifie = nettoyer_texte_pour_audio(texte_brut)
-            sous_morceaux = decouper_texte_en_phrases(texte_purifie, max_chars=1400)
+            sous_morceaux = decouper_texte_en_phrases(texte_purifie, max_chars=1800)
 
             for sous_bloc in sous_morceaux:
                 if not sous_bloc.strip():
                     continue
                 clip_path = os.path.join(dossier_tmp, f"part_{compteur_morceau:05d}.mp3")
-                succes = await synthese_segment_robuste(sous_bloc, voix_voulue, voix_secours, clip_path)
+                succes = synthese_segment_gemini_tts(
+                    segment=sous_bloc,
+                    voix_principale=voix_voulue,
+                    voix_secours=voix_secours,
+                    chemin_mp3_sortie=clip_path,
+                    dossier_tmp=dossier_tmp,
+                    index_clip=compteur_morceau
+                )
                 if succes:
                     fichiers_liste.append(clip_path)
                     compteur_morceau += 1
                 else:
                     print(f"     ⚠️ Échec définitif sur un sous-bloc de {locuteur}.")
-                await asyncio.sleep(1.0)
+
+                time.sleep(1.5)
 
             fichiers_liste.append(chemin_silence)
+
+        if not fichiers_liste:
+            raise RuntimeError("Aucun segment audio n'a pu être généré pour cet épisode.")
 
         concat_txt = os.path.join(dossier_tmp, "concat_list.txt")
         with open(concat_txt, "w", encoding="utf-8") as f:
@@ -336,7 +460,7 @@ async def orchestrer_synthese_async(script_vf, chemin_mp3_final):
             "-safe", "0", "-i", concat_txt,
             "-c", "copy", chemin_mp3_final
         ]
-        subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
     finally:
         shutil.rmtree(dossier_tmp, ignore_errors=True)
@@ -345,7 +469,7 @@ async def orchestrer_synthese_async(script_vf, chemin_mp3_final):
 # ORCHESTRATION GLOBALE RÉSILIENTE
 # ---------------------------------------------------------
 def executer_workflow():
-    print("🎙️ Agent CastMorph démarré sur GitHub Actions.")
+    print(f"🎙️ Agent CastMorph démarré sur GitHub Actions (Moteur TTS : {MODELE_TTS}).")
     fichiers_audio = lister_audios_drive(DRIVE_FOLDER_ID)
 
     if not fichiers_audio:
@@ -371,9 +495,9 @@ def executer_workflow():
                 print(f"⏭️ Déjà traité : {nom_complet}")
                 continue
 
-            print(f"==================================================")
+            print("==================================================")
             print(f"🎧 Traitement de : {nom_complet}")
-            print(f"==================================================")
+            print("==================================================")
 
             chemin_local_source = os.path.join(dossier_telechargement, f"source_{f['id']}{extension}")
 
@@ -402,14 +526,13 @@ def executer_workflow():
                     f_vf.write(texte_export_vf.strip())
                 print(f"  ✓ Traduction VF sauvegardée : Traduction_VF_{base_nom}.txt")
 
-                asyncio.run(orchestrer_synthese_async(script_vf, chemin_mp3))
+                orchestrer_synthese_gemini_tts(script_vf, chemin_mp3)
                 print(f"  ✓ Podcast doublé généré : Podcast_VF_{base_nom}.mp3\n")
 
             except Exception as err_fichier:
                 print(f"  ❌ Erreur rencontrée sur « {nom_complet} » : {err_fichier}")
                 print("  ⏭️ Passage au fichier suivant...\n")
             finally:
-                # Nettoyage immédiat de la source locale pour préserver l'espace disque
                 if os.path.exists(chemin_local_source):
                     os.remove(chemin_local_source)
 
